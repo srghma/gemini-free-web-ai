@@ -1,7 +1,14 @@
 (() => {
   "use strict";
 
-  const PRESET_NAME = "REMOTE_AI_CONTROL";
+  const CONFIG = Object.freeze({
+    wsUrl: "ws://127.0.0.1:8765",
+    presetName: "REMOTE_AI_CONTROL",
+    defaultTimeout: "60s",
+    pollIntervalMs: 1000,
+    domTimeoutMs: 7000,
+  });
+
   const TARGET_CONTENT = `This page has injected chrome extension from ~/projects/gemini-free-web-ai/{content.js,...other extension files,server.py}
 
 Also server.py is running as daemon on machine of user and at http://127.0.0.1:8765
@@ -15,22 +22,27 @@ EXECUTE_NEXT_PYTHON
 \`\`\`py
 ...python code
 \`\`\`
+or with a custom timeout (default is 1 minute; units: s, m, h, d):
+EXECUTE_NEXT_PYTHON(timeout=2h)
+\`\`\`py
+...python code
+\`\`\`
 
-Chrome extension will scan chat, send to server over websocket command execute-python-and-send-output-to with code, and tabId (to send outputs back). After execution is done - server will send to extension the output of command as ordinary message like
+Chrome extension will scan chat, send to server over websocket command execute-python-and-send-output-to with code and timeout.
+After execution is done:
+- Normal completion:
+  PREVOUS_{LANG}_OUTPUT
+  ...
+- If command timed out:
+  PREVIOUS_{LANG}_TIMEOUT
+  ...stdout and stderr with [e] and [o] markers
+- If command errored:
+  PREVIOUS_{LANG}_ERROR (status=n)
+  ...stdout and stderr with [e] and [o] markers
 
-PREVOUS_PYTHON_OUTPUT
-...
+User will initiate such long-running-tasks as usual by writing to this chrome tab. When task is finished, just output summary without EXECUTE_NEXT_* - this way cycle will be stopped.
 
-if there was error then
-
-PREVOUS_PYTHON_ERROR
-...
-
-will be added.
-
-User will initiate such long-running-tasks as usual by writing to this chrome tab. When task is finished, just output summary without EXECUTE_NEXT_PYTHON - this way cycle will be stopped.
-
-Other supported commands are EXECUTE_NEXT_BASH,EXECUTE_NEXT_BUN
+Other supported commands are EXECUTE_NEXT_BASH, EXECUTE_NEXT_BUN (which also support timeout=...)
 
 ### GUIDELINES & ENVIRONMENT:
 1. Environment: NixOS, zsh, bun, python, git, google-chrome-stable, rg, grep, find, fd. Imporant dirs are ~/.dotfiles and ~/projects
@@ -41,118 +53,173 @@ Other supported commands are EXECUTE_NEXT_BASH,EXECUTE_NEXT_BUN
    - Phase 3 (Patch): Apply targeted modifications to the affected source files.
    - Phase 4 (Verify): Re-run tests, builds, or checks to confirm the fix works.`;
 
-  const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
-  let lastHandledTurnText = "";
+  // --- Functional DOM Utilities ---
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-  // Angular-safe native input setter
+  const waitFor = async (predicate, timeout = CONFIG.domTimeoutMs, step = 150) => {
+    const start = Date.now();
+    while (Date.now() - start < timeout) {
+      const result = predicate();
+      if (result) return result;
+      await sleep(step);
+    }
+    return null;
+  };
+
+  const waitForEl = (selector, timeout = CONFIG.domTimeoutMs) =>
+    waitFor(() => {
+      const el = document.querySelector(selector);
+      return el && (el.offsetParent !== null || selector.includes("option") || selector.includes("status"))
+        ? el
+        : null;
+    }, timeout);
+
+  // Angular Ivy native setter pipeline
   const setAngularValue = (el, val) => {
     el.focus();
     el.select?.();
-    const protoSetter = Object.getOwnPropertyDescriptor(
-      el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype,
-      "value"
-    )?.set;
+    const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    Object.getOwnPropertyDescriptor(proto, "value")?.set?.call(el, val) ?? (el.value = val);
 
-    if (protoSetter) {
-      protoSetter.call(el, val);
-    } else {
-      el.value = val;
-    }
+    const dispatch = (type, evtClass = Event, init = {}) =>
+      el.dispatchEvent(new evtClass(type, { bubbles: true, ...init }));
 
-    el.dispatchEvent(new Event("focus", { bubbles: true }));
-    el.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, inputType: "insertText", data: val }));
-    el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: val }));
-    el.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Enter", code: "Enter" }));
-    el.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: "Enter", code: "Enter" }));
-    el.dispatchEvent(new Event("change", { bubbles: true }));
-    el.dispatchEvent(new Event("blur", { bubbles: true }));
+    dispatch("focus");
+    dispatch("beforeinput", InputEvent, { inputType: "insertText", data: val });
+    dispatch("input", InputEvent, { inputType: "insertText", data: val });
+    dispatch("keydown", KeyboardEvent, { key: "Enter", code: "Enter" });
+    dispatch("keyup", KeyboardEvent, { key: "Enter", code: "Enter" });
+    dispatch("change");
+    dispatch("blur");
     el.blur();
   };
 
-  const ensurePresetSelected = async () => {
-    await sleep(1500);
+  // --- UI State Manager ---
+  const StatusManager = (() => {
+    let state = { status: "offline", label: "Connecting..." };
 
-    // 1. Open sidebar if not visible
+    const STYLES = {
+      ready: { bg: "rgba(46, 125, 50, 0.15)", fg: "#81c784", border: "rgba(129, 199, 132, 0.3)", icon: "🟢" },
+      running: { bg: "rgba(245, 124, 0, 0.15)", fg: "#ffb74d", border: "rgba(255, 183, 77, 0.3)", icon: "🟡" },
+      offline: { bg: "rgba(211, 47, 47, 0.15)", fg: "#e57373", border: "rgba(229, 115, 115, 0.3)", icon: "🔴" },
+    };
+
+    const render = () => {
+      const headerRight = document.querySelector("ms-header .toolbar-right");
+      if (!headerRight) return;
+
+      let badge = document.getElementById("gemini-bridge-status");
+      if (!badge) {
+        badge = document.createElement("div");
+        badge.id = "gemini-bridge-status";
+        badge.style.cssText =
+          "display:inline-flex;align-items:center;gap:6px;padding:4px 10px;margin-right:8px;border-radius:12px;font-size:11px;font-family:monospace;font-weight:600;user-select:none;";
+        headerRight.prepend(badge);
+      }
+
+      const style = STYLES[state.status] || STYLES.offline;
+      badge.style.background = style.bg;
+      badge.style.color = style.fg;
+      badge.style.border = `1px solid ${style.border}`;
+      badge.innerText = `${style.icon} ${state.label}`;
+    };
+
+    return {
+      set: (newStatus, newLabel) => {
+        state = { status: newStatus ?? state.status, label: newLabel ?? state.label };
+        render();
+      },
+      render,
+    };
+  })();
+
+  // --- Preset Synchronizer ---
+  const ensurePresetSelected = async () => {
+    // 1. Open sidebar if not already rendered
     let card = document.querySelector('button[aria-label="System instructions"], .system-instructions-card');
     if (!card || card.offsetParent === null) {
-      const tuneBtn = document.querySelector('button[aria-label="Toggle run settings panel"], .runsettings-toggle-button');
+      const tuneBtn = await waitForEl('button[aria-label="Toggle run settings panel"], .runsettings-toggle-button');
       if (tuneBtn) {
         tuneBtn.click();
         await sleep(500);
       }
     }
 
-    // 2. Open System Instructions modal
-    card = document.querySelector('button[aria-label="System instructions"], .system-instructions-card');
-    if (card) {
-      card.click();
-      await sleep(600);
-    }
+    // 2. Open dialog
+    card = await waitForEl('button[aria-label="System instructions"], .system-instructions-card');
+    if (!card) return;
+    card.click();
+    await sleep(400);
 
-    // 3. Find preset dropdown
-    const presetSelect = Array.from(document.querySelectorAll("mat-select"))
-      .find((s) => !/medium|low|high/i.test(s.innerText));
+    // 3. Open preset selector
+    const presetSelect = Array.from(document.querySelectorAll("mat-select")).find(
+      (s) => !/medium|low|high/i.test(s.innerText) && !/gemini/i.test(s.innerText)
+    );
     if (!presetSelect) return;
 
     presetSelect.click();
-    await sleep(400);
+    await waitForEl("mat-option", 4000);
 
     const options = Array.from(document.querySelectorAll("mat-option"));
-    const existingOpt = options.find((opt) => opt.innerText.includes(PRESET_NAME));
-    const untitledOpt = options.find((opt) => opt.innerText.replace(/\n/g, " ").trim() === "Untitled");
+    const existingOpt = options.find((opt) => opt.innerText.includes(CONFIG.presetName));
     const createOpt = options.find((opt) => /create new instruction/i.test(opt.innerText));
-
-    const titleInput = document.querySelector('input[placeholder="Title"]');
-    const textarea = document.querySelector('textarea[aria-label="System instructions"], textarea.in-run-settings');
 
     if (existingOpt) {
       existingOpt.click();
       await sleep(400);
-    } else if (untitledOpt) {
-      untitledOpt.click();
-      await sleep(400);
-      if (titleInput) setAngularValue(titleInput, PRESET_NAME);
-      await sleep(300);
     } else {
-      if (createOpt) {
-        createOpt.click();
-        await sleep(400);
-      } else {
-        document.body.click();
-        await sleep(200);
-      }
-      if (titleInput) setAngularValue(titleInput, PRESET_NAME);
+      if (createOpt) createOpt.click();
+      else document.body.click();
+      await sleep(500);
+    }
+
+    // 4. Update title & content if required
+    const titleInput = await waitForEl('input[placeholder="Title"]', 4000);
+    const textarea = await waitForEl('textarea[aria-label="System instructions"], textarea.in-run-settings', 4000);
+
+    let needsSave = false;
+    if (titleInput && titleInput.value.trim() !== CONFIG.presetName) {
+      setAngularValue(titleInput, CONFIG.presetName);
+      needsSave = true;
       await sleep(300);
     }
 
-    // 4. Update content if differs
     if (textarea && textarea.value.trim() !== TARGET_CONTENT.trim()) {
       setAngularValue(textarea, TARGET_CONTENT);
+      needsSave = true;
       await sleep(300);
-      if (titleInput && titleInput.value.trim() !== PRESET_NAME) {
-        setAngularValue(titleInput, PRESET_NAME);
-        await sleep(200);
-      }
     }
 
-    // 5. Close dialog & sidebar
-    const closeSubPanel = document.querySelector('button[aria-label="Close panel"]');
-    if (closeSubPanel) {
-      closeSubPanel.click();
+    // 5. Wait for "Saved" confirmation indicator
+    if (needsSave) {
+      await waitForEl(".saving-status.visible, [header].saving-status.visible", 4000);
       await sleep(400);
     }
 
+    // 6. Close dialog & sidebar
+    document.querySelector('button[aria-label="Close panel"]')?.click();
+    await sleep(300);
     if (window.innerWidth < 800) {
-      const closeSidebar = document.querySelector('button[aria-label="Close run settings panel"]');
-      if (closeSidebar) {
-        closeSidebar.click();
-        await sleep(300);
-      }
+      document.querySelector('button[aria-label="Close run settings panel"]')?.click();
     }
   };
 
+  // --- Output Formatter Pipeline ---
+  const formatExecutionReply = ({ type, output, timedOut, exitCode }) => {
+    const lang = (type || "PYTHON").toUpperCase();
+    const content = output || "";
+
+    if (timedOut) {
+      return `PREVIOUS_${lang}_TIMEOUT\n${content}`;
+    }
+    if (exitCode !== 0) {
+      return `PREVIOUS_${lang}_ERROR (status=${exitCode})\n${content}`;
+    }
+    return `PREVOUS_${lang}_OUTPUT\n${content}`;
+  };
+
   const submitPrompt = async (text) => {
-    const promptInput = document.querySelector(
+    const promptInput = await waitForEl(
       'textarea[aria-label*="prompt" i], textarea[placeholder*="prompt" i], textarea.textarea'
     );
     if (!promptInput) return;
@@ -170,58 +237,86 @@ Other supported commands are EXECUTE_NEXT_BASH,EXECUTE_NEXT_BUN
     );
   };
 
-  // Watch for AI turns with command execution tags
-  const startTurnScanner = () => {
+  // --- WebSocket Connection ---
+  const createWebSocket = () => {
+    const socket = new WebSocket(CONFIG.wsUrl);
+
+    socket.onopen = () => {
+      console.log("[Bridge] Connected to daemon.");
+      StatusManager.set("ready", "Bridge Ready");
+    };
+
+    socket.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.status === "running") {
+          StatusManager.set("running", `Running ${data.type.toUpperCase()}...`);
+          return;
+        }
+
+        StatusManager.set("ready", "Bridge Ready");
+        submitPrompt(formatExecutionReply(data));
+      } catch (err) {
+        console.error("[Bridge] Failed parsing message:", err);
+      }
+    };
+
+    socket.onclose = () => {
+      StatusManager.set("offline", "Server Offline");
+      setTimeout(createWebSocket, 2000);
+    };
+
+    socket.onerror = () => socket.close();
+
+    return socket;
+  };
+
+  // --- Turn Scanner ---
+  const startTurnScanner = (getSocket) => {
+    let lastHandledText = "";
+
     setInterval(() => {
-      // If currently generating, wait
+      StatusManager.render();
+
       if (document.querySelector('button[aria-label*="Stop" i]')) return;
 
       const turns = document.querySelectorAll("ms-chat-turn, .model-response-text, ms-model-chunk");
       if (turns.length === 0) return;
 
-      const lastTurn = turns[turns.length - 1];
-      const text = lastTurn.innerText?.trim() || "";
+      const text = turns[turns.length - 1].innerText?.trim() || "";
+      if (!text || text === lastHandledText) return;
 
-      if (!text || text === lastHandledTurnText) return;
-
-      const cmdMatch = text.match(
-        /(EXECUTE_NEXT_PYTHON|EXECUTE_NEXT_BASH|EXECUTE_NEXT_BUN)[\s\S]*?```(?:py|python|bash|sh|zsh|bun|js|ts)?\s*\n([\s\S]*?)```/i
+      const match = text.match(
+        /(EXECUTE_NEXT_PYTHON|EXECUTE_NEXT_BASH|EXECUTE_NEXT_BUN)(?:\(timeout=([0-9]+(?:\.[0-9]+)?(?:s|m|h|d)?)\))?[\s\S]*?```(?:py|python|bash|sh|zsh|bun|js|ts)?\s*\n([\s\S]*?)```/i
       );
 
-      if (cmdMatch) {
-        lastHandledTurnText = text;
-        const rawType = cmdMatch[1].toUpperCase();
-        const type = rawType.includes("PYTHON") ? "python" : rawType.includes("BASH") ? "bash" : "bun";
-        const code = cmdMatch[2].trim();
+      if (match) {
+        lastHandledText = text;
+        const [, rawType, timeoutRaw, code] = match;
+        const type = rawType.toLowerCase().replace("execute_next_", "");
+        const timeout = timeoutRaw || CONFIG.defaultTimeout;
 
-        console.log(`[Content] Found ${type} command to execute:\n`, code);
-        chrome.runtime.sendMessage({
-          action: "EXECUTE_COMMAND",
-          type,
-          code,
-        });
+        StatusManager.set("running", `Queued ${type.toUpperCase()} (${timeout})...`);
+
+        const socket = getSocket();
+        if (socket && socket.readyState === WebSocket.OPEN) {
+          socket.send(
+            JSON.stringify({
+              command: `execute-${type}-and-send-output-to`,
+              type,
+              timeout,
+              code: code.trim(),
+            })
+          );
+        }
       }
-    }, 1000);
+    }, CONFIG.pollIntervalMs);
   };
 
-  // Receive execution results and feed back to prompt
-  chrome.runtime.onMessage.addListener((message) => {
-    if (message.action === "EXECUTION_RESULT") {
-      const { type, output, error } = message;
-      const upper = type.toUpperCase();
-
-      let reply = `PREVOUS_${upper}_OUTPUT\n${output || ""}`;
-      if (error && error.trim().length > 0) {
-        reply += `\n\nPREVOUS_${upper}_ERROR\n${error.trim()}`;
-      }
-
-      console.log(`[Content] Submitting ${upper} execution result to AI Studio...`);
-      submitPrompt(reply);
-    }
-  });
-
+  // --- Bootstrap ---
   (async () => {
+    let activeSocket = createWebSocket();
     await ensurePresetSelected();
-    startTurnScanner();
+    startTurnScanner(() => activeSocket);
   })();
 })();

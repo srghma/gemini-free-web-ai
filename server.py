@@ -4,17 +4,101 @@ import base64
 import hashlib
 import json
 import os
-import subprocess
+import re
 import struct
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = 8765
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+TIMEOUT_UNITS = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
 
-def execute_code(lang: str, code: str) -> tuple[str, str, int]:
-    """Execute code in user's environment (NixOS / zsh / bun / python)."""
+@dataclass(frozen=True)
+class ExecutionResult:
+    output: str
+    timed_out: bool
+    exit_code: int
+
+# --- Pure Parsing & Formatting Functions ---
+
+def parse_timeout(val: str | None, default: float = 60.0) -> float:
+    """Parse timeout strings like '2h', '30m', '45s', '1d'. Default: 60s."""
+    if not val:
+        return default
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)([smhd])?", val.strip().lower())
+    if not match:
+        return default
+    num, unit = match.groups()
+    return float(num) * TIMEOUT_UNITS.get(unit or "s", 1.0)
+
+def format_interleaved(segments: list[tuple[str, str]]) -> str:
+    """Interleave stdout ('o') and stderr ('e').
+    Omits initial '[o]' if first non-empty segment is stdout."""
+    result: list[str] = []
+    current_stream: str | None = None
+    is_first = True
+
+    for stream_type, text in segments:
+        if not text:
+            continue
+        if current_stream != stream_type:
+            if not (is_first and stream_type == "o"):
+                result.append(f"[{stream_type}]")
+            current_stream = stream_type
+            is_first = False
+        result.append(text)
+
+    return "".join(result)
+
+# --- Subprocess Execution Pipeline ---
+
+async def run_subprocess_interleaved(cmd: list[str], cwd: str, timeout: float) -> ExecutionResult:
+    """Execute command, read stdout/stderr concurrently, handle timeout."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd
+    )
+
+    segments: list[tuple[str, str]] = []
+
+    async def read_stream(stream: asyncio.StreamReader, stream_type: str):
+        while True:
+            chunk = await stream.read(1024)
+            if not chunk:
+                break
+            segments.append((stream_type, chunk.decode("utf-8", errors="replace")))
+
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(
+                read_stream(proc.stdout, "o"),
+                read_stream(proc.stderr, "e"),
+                proc.wait()
+            ),
+            timeout=timeout
+        )
+        return ExecutionResult(
+            output=format_interleaved(segments),
+            timed_out=False,
+            exit_code=proc.returncode or 0
+        )
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
+        return ExecutionResult(
+            output=format_interleaved(segments),
+            timed_out=True,
+            exit_code=124
+        )
+
+async def execute_task(lang: str, code: str, timeout: float) -> ExecutionResult:
     ext_map = {"python": ".py", "bash": ".sh", "bun": ".ts"}
     suffix = ext_map.get(lang, ".sh")
 
@@ -23,35 +107,28 @@ def execute_code(lang: str, code: str) -> tuple[str, str, int]:
         tmp_path = f.name
 
     try:
-        if lang == "python":
-            cmd = ["python3", tmp_path]
-        elif lang == "bun":
-            cmd = ["bun", "run", tmp_path]
-        else:
-            cmd = ["zsh", tmp_path]
+        cmd = {
+            "python": ["python3", tmp_path],
+            "bun": ["bun", "run", tmp_path],
+        }.get(lang, ["zsh", tmp_path])
 
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=120,
-            cwd=str(Path.home() / "projects") if (Path.home() / "projects").exists() else str(Path.home())
-        )
-        return proc.stdout, proc.stderr, proc.returncode
-    except subprocess.TimeoutExpired:
-        return "", "Execution timed out after 120 seconds.", 124
+        work_dir = Path.home() / "projects"
+        cwd = str(work_dir) if work_dir.exists() else str(Path.home())
+
+        return await run_subprocess_interleaved(cmd, cwd, timeout)
     except Exception as e:
-        return "", str(e), 1
+        return ExecutionResult(output=f"[e]{e}", timed_out=False, exit_code=1)
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
-def make_ws_frame(message: str) -> bytes:
-    """Pack string into an RFC 6455 unmasked server-to-client text frame."""
+# --- WebSocket Framing & Transport ---
+
+def make_ws_frame(message: str, opcode: int = 0x81) -> bytes:
     data = message.encode("utf-8")
     length = len(data)
-    frame = bytearray([0x81])  # FIN + Text Opcode
+    frame = bytearray([opcode])
+
     if length <= 125:
         frame.append(length)
     elif length <= 65535:
@@ -60,18 +137,23 @@ def make_ws_frame(message: str) -> bytes:
     else:
         frame.append(127)
         frame.extend(struct.pack("!Q", length))
+
     frame.extend(data)
     return bytes(frame)
 
-async def read_ws_frame(reader: asyncio.StreamReader) -> str | None:
-    """Read and unmask a client-to-server WebSocket frame."""
+async def read_ws_frame(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> str | None:
     header = await reader.read(2)
     if len(header) < 2:
         return None
     b1, b2 = header
     opcode = b1 & 0x0F
-    if opcode == 0x8:  # Close frame
+
+    if opcode == 0x8:  # Close
         return None
+    if opcode == 0x9:  # Ping -> reply with Pong
+        writer.write(make_ws_frame("", opcode=0x8A))
+        await writer.drain()
+        return ""
 
     length = b2 & 0x7F
     if length == 126:
@@ -83,11 +165,54 @@ async def read_ws_frame(reader: asyncio.StreamReader) -> str | None:
 
     mask = await reader.read(4)
     payload = await reader.readexactly(length)
-    unmasked = bytearray(b ^ mask[i % 4] for i, b in enumerate(payload))
-    return unmasked.decode("utf-8")
+    return bytearray(b ^ mask[i % 4] for i, b in enumerate(payload)).decode("utf-8")
+
+# --- Central Execution Queue (Serial Execution) ---
+
+execution_queue: asyncio.Queue[tuple[asyncio.StreamWriter, dict]] = asyncio.Queue()
+
+async def queue_worker():
+    while True:
+        writer, task = await execution_queue.get()
+        try:
+            lang = task.get("type", "python")
+            code = task.get("code", "")
+            timeout = parse_timeout(task.get("timeout"))
+
+            print(f"\n[QUEUE] Executing {lang.upper()} (timeout: {timeout}s)...")
+
+            # Notify client that command started
+            try:
+                writer.write(make_ws_frame(json.dumps({"status": "running", "type": lang})))
+                await writer.drain()
+            except Exception:
+                pass
+
+            res = await execute_task(lang, code, timeout)
+
+            response = {
+                "status": "timeout" if res.timed_out else ("error" if res.exit_code != 0 else "completed"),
+                "type": lang,
+                "output": res.output,
+                "timedOut": res.timed_out,
+                "exitCode": res.exit_code,
+            }
+
+            try:
+                writer.write(make_ws_frame(json.dumps(response)))
+                await writer.drain()
+                print(f"[QUEUE] Done {lang.upper()} (Status: {response['status']}, Exit: {res.exit_code})")
+            except Exception as e:
+                print(f"[QUEUE] Client disconnected before receiving reply: {e}")
+
+        except Exception as err:
+            print(f"[QUEUE] Worker error: {err}")
+        finally:
+            execution_queue.task_done()
+
+# --- Server Lifecycle ---
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    # 1. Perform HTTP -> WebSocket Handshake
     headers = b""
     while b"\r\n\r\n" not in headers:
         line = await reader.readline()
@@ -96,10 +221,10 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         headers += line
 
     headers_str = headers.decode("utf-8", errors="ignore")
-    ws_key = None
-    for line in headers_str.split("\r\n"):
-        if line.lower().startswith("sec-websocket-key:"):
-            ws_key = line.split(":", 1)[1].strip()
+    ws_key = next(
+        (l.split(":", 1)[1].strip() for l in headers_str.split("\r\n") if l.lower().startswith("sec-websocket-key:")),
+        None
+    )
 
     if not ws_key:
         writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
@@ -116,44 +241,28 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     )
     writer.write(handshake.encode())
     await writer.drain()
-    print("[Server] Extension connected via WebSocket.")
+    print("[Server] Tab connected via WebSocket.")
 
-    # 2. Main execution loop
     try:
         while True:
-            raw_msg = await read_ws_frame(reader)
+            raw_msg = await read_ws_frame(reader, writer)
             if raw_msg is None:
                 break
+            if not raw_msg:
+                continue
 
-            try:
-                data = json.loads(raw_msg)
-                code = data.get("code", "")
-                lang = data.get("type", "python")
-                tab_id = data.get("tabId")
-
-                print(f"\n[EXEC] Running {lang.upper()} (tabId: {tab_id})...")
-                stdout, stderr, code_res = execute_code(lang, code)
-
-                response = {
-                    "tabId": tab_id,
-                    "type": lang,
-                    "output": stdout,
-                    "error": stderr,
-                    "exitCode": code_res
-                }
-                writer.write(make_ws_frame(json.dumps(response)))
-                await writer.drain()
-                print(f"[EXEC] Sent output back to tab {tab_id}.")
-            except json.JSONDecodeError:
-                pass
-    except (asyncio.IncompleteReadError, ConnectionResetError):
+            data = json.loads(raw_msg)
+            await execution_queue.put((writer, data))
+            print(f"[Server] Enqueued {data.get('type')} (Queue depth: {execution_queue.qsize()})")
+    except (asyncio.IncompleteReadError, ConnectionResetError, json.JSONDecodeError):
         pass
     finally:
         writer.close()
         await writer.wait_closed()
-        print("[Server] Extension disconnected.")
+        print("[Server] Tab disconnected.")
 
 async def main():
+    asyncio.create_task(queue_worker())
     server = await asyncio.start_server(handle_client, HOST, PORT)
     print(f"[*] Gemini AI Bridge daemon running at ws://{HOST}:{PORT}")
     async with server:
