@@ -1,12 +1,15 @@
 {
   "manifest_version": 3,
   "name": "Gemini Free Web AI Controller",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Bridge Google AI Studio directly to local execution daemon",
   "content_scripts": [
     {
-      "matches": ["https://aistudio.google.com/prompts/*", "https://aistudio.google.com/live/*"],
-      "js": ["content.js"],
+      "matches": [
+        "https://aistudio.google.com/prompts/*",
+        "https://aistudio.google.com/live/*"
+      ],
+      "js": ["src/content.ts"],
       "run_at": "document_idle"
     }
   ]
