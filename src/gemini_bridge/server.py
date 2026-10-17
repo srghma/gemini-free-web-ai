@@ -3,6 +3,7 @@ import base64
 from datetime import datetime
 import hashlib
 import json
+from pathlib import Path
 import sys
 from rich.markup import escape
 from rich.live import Live
@@ -20,6 +21,8 @@ from .transport import (
     read_ws_frame,
 )
 from .tui import console, key_listener, render_tui
+
+EXPORTS_DIR = Path.home() / "projects" / "gemini-free-web-ai" / "exports"
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     headers = b""
@@ -104,6 +107,18 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                             pass
 
                 render_event.set()
+
+            elif event == "export_chat_json":
+                tab_id = data.get("tabId") or current_tab_id or "chat"
+                export_data = data.get("exportJson")
+                if export_data:
+                    EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+                    ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    out_path = EXPORTS_DIR / f"{tab_id}_{ts_str}.json"
+                    out_path.write_text(json.dumps(export_data, indent=2), encoding="utf-8")
+                    tab_tag = escape(f"[{tab_id}]")
+                    state.add_log(f"💾 [bold green]Saved chat JSON export for {tab_tag} -> {out_path.name}[/bold green]")
+                    render_event.set()
 
             elif event == "tab_disconnected":
                 tab_id = data.get("tabId") or current_tab_id

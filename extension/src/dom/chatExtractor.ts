@@ -132,7 +132,7 @@ export const extractAllChatTurns = (isGlobalPrinting: boolean): ExtractedTurn[] 
     // Model Response Chat Content
     const clone = turn.cloneNode(true) as HTMLElement;
     const modelJunkEls = clone.querySelectorAll(
-      "ms-code-block, ms-thought-chunk, mat-icon, button, .model-prompt-footer"
+      "ms-code-block, ms-thought-chunk, mat-icon, button, .model-prompt-footer, .model-run-time-pill, .turn-footer"
     );
     for (const el of modelJunkEls) {
       el.remove();
@@ -153,11 +153,14 @@ export const extractAllChatTurns = (isGlobalPrinting: boolean): ExtractedTurn[] 
 
     const hasPill = !!turn.querySelector(".model-run-time-pill, .response-feedback-button");
     const isLastTurn = idx === turns.length - 1;
-    const status = hasPill
-      ? "completed"
-      : isLastTurn && isGlobalPrinting
+    const status =
+      isLastTurn && isGlobalPrinting
         ? "streaming"
-        : "completed";
+        : hasPill
+          ? "completed"
+          : isLastTurn
+            ? "streaming"
+            : "completed";
 
     let type: ExtractedTurn["type"] = "ai_chat";
     if (thinkingContent && !chatContent && effectiveCodeBlocks.length === 0) {

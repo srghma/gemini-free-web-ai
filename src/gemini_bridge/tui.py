@@ -2,9 +2,9 @@ import asyncio
 import os
 import select
 import sys
+import termios
 import time
-import readchar
-from readchar import key as K
+import tty
 from rich.console import Console, Group
 from rich.layout import Layout
 from rich.markup import escape
@@ -17,14 +17,11 @@ from .models import ServerState, TabSession
 
 console = Console()
 
-def get_key_nonblocking(timeout: float = 0.2) -> str | None:
+def get_char_nonblocking(fd: int, timeout: float = 0.2) -> str | None:
     try:
-        fd = sys.stdin.fileno()
-        if not os.isatty(fd):
-            return None
-        r, _, _ = select.select([sys.stdin], [], [], timeout)
+        r, _, _ = select.select([fd], [], [], timeout)
         if r:
-            return readchar.readkey()
+            return os.read(fd, 32).decode("utf-8", errors="ignore")
     except Exception:
         pass
     return None
@@ -124,11 +121,9 @@ def render_tui(height: int, state: ServerState, execution_queue: asyncio.Queue) 
 
     selected_tab = state.get_selected_tab()
 
-    # 1. Chat View (Left)
     chat_width = max(30, int(console.width * 0.6))
     layout["chat_view"].update(render_chat_view(selected_tab, chat_width, height))
 
-    # 2. Header
     active_count = len(state.tabs)
     q_depth = execution_queue.qsize()
     header_content = (
@@ -138,7 +133,6 @@ def render_tui(height: int, state: ServerState, execution_queue: asyncio.Queue) 
     )
     layout["sidebar"]["header"].update(Panel(Text.from_markup(header_content), border_style="cyan"))
 
-    # 3. Tabs Bar
     tab_list = state.tab_list
     tab_cells = []
     if not tab_list:
@@ -159,7 +153,6 @@ def render_tui(height: int, state: ServerState, execution_queue: asyncio.Queue) 
     tabs_table.add_row(*tab_cells)
     layout["sidebar"]["tabs_bar"].update(Panel(tabs_table, title="[bold]Active Chrome Tabs[/bold]", border_style="dim"))
 
-    # 4. Active Task Banner
     cur_task = state.current_executing_task
     if cur_task:
         task_tab = escape(f"[{cur_task['tab_id']}]")
@@ -172,7 +165,6 @@ def render_tui(height: int, state: ServerState, execution_queue: asyncio.Queue) 
         exec_banner = "[dim]Queue idle - waiting for tasks[/dim]"
     layout["sidebar"]["active_task"].update(Panel(Text.from_markup(exec_banner), title="[bold]Active Task[/bold]", border_style="yellow" if cur_task else "dim"))
 
-    # 5. Live Composer Preview
     if selected_tab and selected_tab.prompt_text:
         p_text = (selected_tab.prompt_text[:120] + "...") if len(selected_tab.prompt_text) > 120 else selected_tab.prompt_text
         composer_content = Text(f"✍️ ({len(selected_tab.prompt_text)} chars): {p_text}", style="italic cyan")
@@ -180,68 +172,87 @@ def render_tui(height: int, state: ServerState, execution_queue: asyncio.Queue) 
         composer_content = Text("Prompt box empty", style="dim italic")
     layout["sidebar"]["composer"].update(Panel(composer_content, title="[bold]Composer Preview (Live)[/bold]", border_style="cyan"))
 
-    # 6. Central Logs
     log_lines = list(state.logs)[-8:]
     log_texts = [Text.from_markup(l) for l in log_lines] or [Text("Waiting for events...", style="dim")]
     layout["sidebar"]["logs"].update(Panel(Group(*log_texts), title="[bold]Central Queue & Logs[/bold]", border_style="dim"))
 
-    # 7. Navigation Footer
-    nav_hint = escape("[q] Quit │ [1-9]/[h/l] Tabs │ [j/k]/[↑/↓] Scroll │ [G] Follow Bottom")
+    nav_hint = escape("[q] Quit │ [1-9]/[h/l] Tabs │ [j/k]/[↑/↓] Scroll │ [G] Bottom")
     layout["sidebar"]["footer"].update(Panel(Text.from_markup(f"[dim]{nav_hint}[/dim]"), border_style="dim"))
 
     return layout
 
 async def key_listener(state: ServerState, render_event: asyncio.Event):
     loop = asyncio.get_running_loop()
-    while not state.stop_requested:
-        k = await loop.run_in_executor(None, get_key_nonblocking, 0.2)
-        if not k:
-            continue
-        tabs_count = len(state.tabs)
-        cur_tab = state.get_selected_tab()
+    fd = sys.stdin.fileno()
+    is_tty = os.isatty(fd)
+    old_settings = None
 
-        if k in (K.RIGHT, "l", "L", K.TAB):
-            if tabs_count:
+    if is_tty:
+        try:
+            old_settings = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+        except Exception:
+            old_settings = None
+
+    try:
+        while not state.stop_requested:
+            ch = await loop.run_in_executor(None, get_char_nonblocking, fd, 0.2)
+            if not ch:
+                continue
+
+            tabs_count = len(state.tabs)
+            cur_tab = state.get_selected_tab()
+
+            # Arrow keys & Escape sequences
+            if ch in ("\x1b[C", "l", "L", "\t"):
+                if tabs_count:
+                    state.user_manually_selected = True
+                    state.selected_tab_idx = (state.selected_tab_idx + 1) % tabs_count
+            elif ch in ("\x1b[D", "h", "H", "\x7f"):
+                if tabs_count:
+                    state.user_manually_selected = True
+                    state.selected_tab_idx = (state.selected_tab_idx - 1) % tabs_count
+            elif ch.isdigit() and 1 <= int(ch) <= tabs_count:
                 state.user_manually_selected = True
-                state.selected_tab_idx = (state.selected_tab_idx + 1) % tabs_count
-        elif k in (K.LEFT, "h", "H", K.BACKSPACE):
-            if tabs_count:
-                state.user_manually_selected = True
-                state.selected_tab_idx = (state.selected_tab_idx - 1) % tabs_count
-        elif k.isdigit() and 1 <= int(k) <= tabs_count:
-            state.user_manually_selected = True
-            state.selected_tab_idx = int(k) - 1
+                state.selected_tab_idx = int(ch) - 1
 
-        elif k in (K.UP, "k", "K"):
-            if cur_tab:
-                cur_tab.follow_bottom = False
-                cur_tab.scroll_offset += 3
-        elif k in (K.DOWN, "j", "J"):
-            if cur_tab:
-                cur_tab.scroll_offset = max(0, cur_tab.scroll_offset - 3)
-                if cur_tab.scroll_offset == 0:
+            # Up / Down Scrolling
+            elif ch in ("\x1b[A", "k", "K"):
+                if cur_tab:
+                    cur_tab.follow_bottom = False
+                    cur_tab.scroll_offset += 4
+            elif ch in ("\x1b[B", "j", "J"):
+                if cur_tab:
+                    cur_tab.scroll_offset = max(0, cur_tab.scroll_offset - 4)
+                    if cur_tab.scroll_offset == 0:
+                        cur_tab.follow_bottom = True
+            elif ch in ("u", "U", "\x1b[5~"):  # Page up
+                if cur_tab:
+                    cur_tab.follow_bottom = False
+                    cur_tab.scroll_offset += 16
+            elif ch in ("d", "D", "\x1b[6~"):  # Page down
+                if cur_tab:
+                    cur_tab.scroll_offset = max(0, cur_tab.scroll_offset - 16)
+                    if cur_tab.scroll_offset == 0:
+                        cur_tab.follow_bottom = True
+            elif ch in ("g", "\x1b[H"):        # Top
+                if cur_tab:
+                    cur_tab.follow_bottom = False
+                    cur_tab.scroll_offset = 99999
+            elif ch in ("G", "\x1b[F"):        # Bottom
+                if cur_tab:
+                    cur_tab.scroll_offset = 0
                     cur_tab.follow_bottom = True
-        elif k in ("u", "U", K.PAGE_UP):
-            if cur_tab:
-                cur_tab.follow_bottom = False
-                cur_tab.scroll_offset += 12
-        elif k in ("d", "D", K.PAGE_DOWN):
-            if cur_tab:
-                cur_tab.scroll_offset = max(0, cur_tab.scroll_offset - 12)
-                if cur_tab.scroll_offset == 0:
-                    cur_tab.follow_bottom = True
-        elif k in ("g", K.HOME):
-            if cur_tab:
-                cur_tab.follow_bottom = False
-                cur_tab.scroll_offset = 99999
-        elif k in ("G", K.END):
-            if cur_tab:
-                cur_tab.scroll_offset = 0
-                cur_tab.follow_bottom = True
 
-        elif k in ("q", "Q", K.CTRL_C, K.CTRL_D):
-            state.stop_requested = True
+            elif ch in ("q", "Q", "\x03", "\x04"):
+                state.stop_requested = True
+                render_event.set()
+                break
+
             render_event.set()
-            break
-
-        render_event.set()
+    finally:
+        if is_tty and old_settings:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            except Exception:
+                pass

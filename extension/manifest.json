@@ -1,18 +1,23 @@
 {
   "manifest_version": 3,
   "name": "Gemini Free Web AI Controller",
-  "version": "1.3.0",
-  "description": "Bridge Google AI Studio directly to local execution daemon",
+  "version": "1.4.0",
+  "description": "Bridge Google AI Studio directly to local execution daemon with zero-delay network stream interceptor",
   "host_permissions": [
     "http://127.0.0.1/*",
     "http://localhost/*"
   ],
   "content_scripts": [
     {
-      "matches": [
-        "https://aistudio.google.com/*"
-      ],
+      "matches": ["https://aistudio.google.com/*"],
+      "js": ["src/injected.ts"],
+      "world": "MAIN",
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["https://aistudio.google.com/*"],
       "js": ["src/content.ts"],
+      "world": "ISOLATED",
       "run_at": "document_end"
     }
   ]

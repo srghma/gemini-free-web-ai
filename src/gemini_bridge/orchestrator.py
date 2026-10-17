@@ -17,6 +17,10 @@ class CommandBatch:
 
 execution_queue: asyncio.Queue[CommandBatch] = asyncio.Queue()
 
+# Track when a turn was last updated to ensure 1.8s quiescence before execution
+_turn_stability: dict[str, float] = {}
+_turn_content_hashes: dict[str, str] = {}
+
 async def batch_queue_worker():
     while not state.stop_requested:
         batch = await execution_queue.get()
@@ -50,7 +54,6 @@ async def batch_queue_worker():
             log_to_file(f"EXECUTE [{tab_id}] ({idx + 1}/{total}) {lang.upper()} (timeout: {timeout}s)\n--- CODE ---\n{code}\n--- END CODE ---")
             log_raw_ws("EVENT", tab_id, f"TASK_START ({idx + 1}/{total}): {lang.upper()}")
 
-            # Inform tab status badge
             try:
                 running_frame = json.dumps({"status": "running", "type": lang, "timeout": f"{timeout}s"})
                 writer.write(make_ws_frame(running_frame))
@@ -80,7 +83,6 @@ async def batch_queue_worker():
             replies.append(format_execution_reply(lang, res))
             render_event.set()
 
-        # Group all replies and dispatch back to prompt box
         composite_reply = group_replies(replies)
         if composite_reply:
             try:
@@ -121,7 +123,6 @@ def handle_preference_vote(session: TabSession, vote_dict: dict, writer: asyncio
         return
 
     session.handled_vote_keys.add(vote_key)
-    # Pick variant randomly between available options (0 or 1)
     chosen_idx = random.choice([0, 1]) if len(options) > 1 else 0
     tab_tag = escape(f"[{session.tab_id}]")
     state.add_log(f"⚖️ [bold yellow]Preference vote detected for {tab_tag}! Auto-selecting Variant #{chosen_idx + 1}[/bold yellow]")
@@ -140,16 +141,28 @@ def check_and_dispatch_settled_turns(session: TabSession, writer: asyncio.Stream
         return
 
     latest_turn = session.turns[-1]
-    # Check if latest turn is AI response (not user) and has not been handled yet
     if latest_turn.type == "user" or latest_turn.id in session.handled_turn_ids:
         return
 
-    # Extract commands from this model turn
+    # Check turn content stability
+    content_fingerprint = f"{len(latest_turn.chat_content)}:{len(latest_turn.code_blocks)}:{[len(cb.code) for cb in latest_turn.code_blocks]}"
+    now = time.time()
+
+    if _turn_content_hashes.get(latest_turn.id) != content_fingerprint:
+        _turn_content_hashes[latest_turn.id] = content_fingerprint
+        _turn_stability[latest_turn.id] = now
+        return
+
+    stable_duration = now - _turn_stability.get(latest_turn.id, now)
+    # Require turn to be completely unchanged for >= 1.8s and completed
+    if stable_duration < 1.8 and latest_turn.status != "completed":
+        return
+
     commands = extract_commands_from_turn(latest_turn)
     session.handled_turn_ids.add(latest_turn.id)
 
     if commands:
         tab_tag = escape(f"[{session.tab_id}]")
-        state.add_log(f"📥 Found [cyan]{len(commands)}[/cyan] command(s) in turn {latest_turn.id[-6:]} for {tab_tag}")
+        state.add_log(f"📥 Found [cyan]{len(commands)}[/cyan] command(s) in settled turn {latest_turn.id[-6:]} for {tab_tag}")
         execution_queue.put_nowait(CommandBatch(session.tab_id, writer, commands))
         render_event.set()

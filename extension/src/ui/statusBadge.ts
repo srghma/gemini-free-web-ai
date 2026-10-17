@@ -4,15 +4,12 @@ export class StatusBadgeManager {
   private state = {
     status: "offline" as BridgeConnectionStatus,
     label: "Connecting...",
-    lastCmd: null as string | null,
-    lastElapsed: null as string | null,
   };
 
-  private startTime = 0;
-  private timerInterval: ReturnType<typeof setInterval> | null = null;
   private lastPromptStatus: PromptBoxStatus | undefined;
   private isUserDisabled = false;
   private onToggleCallback: ((enabled: boolean) => void) | null = null;
+  private onExportCallback: (() => void) | null = null;
 
   constructor() {
     this.render();
@@ -22,6 +19,10 @@ export class StatusBadgeManager {
     this.onToggleCallback = cb;
   }
 
+  public onExport(cb: () => void): void {
+    this.onExportCallback = cb;
+  }
+
   public get isDisabled(): boolean {
     return this.isUserDisabled;
   }
@@ -29,21 +30,12 @@ export class StatusBadgeManager {
   public setRunning(type: string, _timeout?: string): void {
     if (this.isUserDisabled) return;
     this.state.status = "running";
-    this.startTime = Date.now();
     this.state.label = `Executing ${type.toUpperCase()}...`;
-
-    if (this.timerInterval) clearInterval(this.timerInterval);
-    this.timerInterval = setInterval(() => {
-      const sec = Math.round((Date.now() - this.startTime) / 1000);
-      this.state.label = `Executing ${type.toUpperCase()} (${sec}s)...`;
-      this.render();
-    }, 1000);
     this.render();
   }
 
   public setReady(msg = "Daemon Ready"): void {
     if (this.isUserDisabled) return;
-    if (this.timerInterval) clearInterval(this.timerInterval);
     this.state.status = "ready";
     this.state.label = msg;
     this.render();
@@ -51,7 +43,6 @@ export class StatusBadgeManager {
 
   public setOffline(msg = "Daemon Offline"): void {
     if (this.isUserDisabled) return;
-    if (this.timerInterval) clearInterval(this.timerInterval);
     this.state.status = "offline";
     this.state.label = msg;
     this.render();
@@ -124,23 +115,40 @@ export class StatusBadgeManager {
     }
     textSpan.innerText = labelText;
 
+    // Export JSON Button
+    let exportBtn = badge.querySelector<HTMLButtonElement>("#gemini-bridge-export-btn");
+    if (!exportBtn) {
+      exportBtn = document.createElement("button");
+      exportBtn.id = "gemini-bridge-export-btn";
+      exportBtn.innerText = "📥 JSON";
+      exportBtn.title = "Export current chat history as Google AI Studio JSON to clipboard";
+      exportBtn.style.cssText =
+        "margin-left:6px;padding:2px 6px;border-radius:6px;font-size:10px;font-family:inherit;font-weight:700;cursor:pointer;border:1px solid rgba(255,255,255,0.25);background:rgba(255,255,255,0.1);color:inherit;transition:all 0.2s;";
+      badge.appendChild(exportBtn);
+
+      exportBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this.onExportCallback?.();
+      });
+    }
+
+    // Toggle Disconnect/Connect Button
     let btn = badge.querySelector<HTMLButtonElement>("#gemini-bridge-toggle-btn");
     if (!btn) {
       btn = document.createElement("button");
       btn.id = "gemini-bridge-toggle-btn";
       btn.style.cssText =
-        "margin-left:6px;padding:2px 6px;border-radius:6px;font-size:10px;font-family:inherit;font-weight:700;cursor:pointer;border:1px solid rgba(255,255,255,0.25);background:rgba(255,255,255,0.1);color:inherit;transition:all 0.2s;";
+        "margin-left:4px;padding:2px 6px;border-radius:6px;font-size:10px;font-family:inherit;font-weight:700;cursor:pointer;border:1px solid rgba(255,255,255,0.25);background:rgba(255,255,255,0.1);color:inherit;transition:all 0.2s;";
       badge.appendChild(btn);
 
       btn.addEventListener("click", (e) => {
         e.stopPropagation();
         this.isUserDisabled = !this.isUserDisabled;
-        if (this.isUserDisabled && this.timerInterval) clearInterval(this.timerInterval);
         this.render();
         this.onToggleCallback?.(!this.isUserDisabled);
       });
     }
 
-    btn.innerText = this.isUserDisabled ? "🔌 Connect" : "✕ Disconnect";
+    btn.innerText = this.isUserDisabled ? "🔌 Connect" : "✕";
   }
 }
