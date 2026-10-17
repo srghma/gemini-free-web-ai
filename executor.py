@@ -59,6 +59,13 @@ def get_execution_env() -> dict[str, str]:
     return env
 
 
+def get_default_work_dir() -> str:
+    repo = Path.home() / "projects" / "gemini-free-web-ai"
+    if repo.exists():
+        return str(repo)
+    return str(Path.cwd())
+
+
 async def run_subprocess_interleaved(cmd: list[str], cwd: str, timeout: float) -> ExecutionResult:
     """Execute command in a new process group, read stdout/stderr concurrently, handle timeout."""
     proc = await asyncio.create_subprocess_exec(
@@ -67,7 +74,7 @@ async def run_subprocess_interleaved(cmd: list[str], cwd: str, timeout: float) -
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd,
         env=get_execution_env(),
-        start_new_session=True,  # Creates a new process group so killpg kills all children
+        start_new_session=True,
     )
 
     segments: list[tuple[str, str]] = []
@@ -95,7 +102,6 @@ async def run_subprocess_interleaved(cmd: list[str], cwd: str, timeout: float) -
         )
     except asyncio.TimeoutError:
         try:
-            # Kill the entire process group
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             await proc.wait()
         except Exception:
@@ -121,9 +127,7 @@ async def execute_task(lang: str, code: str, timeout: float) -> ExecutionResult:
             "bun": ["bun", "run", tmp_path],
         }.get(lang, ["zsh", tmp_path])
 
-        work_dir = Path.home() / "projects"
-        cwd = str(work_dir) if work_dir.exists() else str(Path.home())
-
+        cwd = get_default_work_dir()
         return await run_subprocess_interleaved(cmd, cwd, timeout)
     except Exception as e:
         return ExecutionResult(output=f"[e]{e}", timed_out=False, exit_code=1)

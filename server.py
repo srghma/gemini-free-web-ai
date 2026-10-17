@@ -74,6 +74,8 @@ class TabSession:
     title: str = "Chat"
     is_printing: bool = False
     button_label: str = "Run"
+    prompt_text: str = ""
+    variants: list[dict] = field(default_factory=list)
     turns: list[ChatTurn] = field(default_factory=list)
     last_seen: datetime = field(default_factory=datetime.now)
 
@@ -255,10 +257,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     writer.write(handshake.encode())
     await writer.drain()
 
-    current_tab_id = f"tab_{id(writer) % 1000}"
-    state.tabs[current_tab_id] = TabSession(tab_id=current_tab_id)
-    state.add_log(f"🟢 [green]Chrome tab connected: \\[{escape(current_tab_id)}\\][/green]")
-    render_event.set()
+    current_tab_id: str | None = None
 
     try:
         while True:
@@ -272,16 +271,22 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             event = data.get("event")
 
             if event == "tab_connected":
-                current_tab_id = data.get("tabId", current_tab_id)
-                session = state.tabs.setdefault(current_tab_id, TabSession(tab_id=current_tab_id))
-                session.title = data.get("title", "Chat")
-                render_event.set()
+                current_tab_id = data.get("tabId")
+                if current_tab_id:
+                    session = state.tabs.setdefault(current_tab_id, TabSession(tab_id=current_tab_id))
+                    session.title = data.get("title", "Chat")
+                    session.last_seen = datetime.now()
+                    state.add_log(f"🟢 [green]Chrome tab connected: \\[{escape(current_tab_id)}\\] ({escape(session.title)})[/green]")
+                    render_event.set()
 
             elif event == "tab_chat_update":
-                tab_id = data.get("tabId", current_tab_id)
+                tab_id = data.get("tabId") or current_tab_id
+                if not tab_id:
+                    continue
                 session = state.tabs.setdefault(tab_id, TabSession(tab_id=tab_id))
                 session.is_printing = data.get("isPrinting", False)
                 session.button_label = data.get("buttonLabel", "Run")
+                session.prompt_text = data.get("promptText", "")
                 session.last_seen = datetime.now()
 
                 raw_turns = data.get("turns", [])
@@ -298,7 +303,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     for t in raw_turns
                 ]
 
-                # Auto-focus the tab that has active turns unless user manually switched
                 if not state.user_manually_selected and session.turns:
                     cur_sel = state.get_selected_tab()
                     if not cur_sel or not cur_sel.turns:
@@ -309,17 +313,30 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
                 render_event.set()
 
+            elif event == "variants_proposed":
+                tab_id = data.get("tabId") or current_tab_id
+                state.add_log(f"⚖️ [bold yellow]Two variants proposed for \\[{escape(str(tab_id))}\\]! Auto-selecting Variant 1[/bold yellow]")
+                # Server instructs extension to select Variant 1 (index 0)
+                writer.write(make_ws_frame(json.dumps({"command": "select_variant", "tabId": tab_id, "variantIndex": 0})))
+                await writer.drain()
+                render_event.set()
+
             elif "command" in data:
                 await execution_queue.put((writer, data))
-                state.add_log(f"📥 Queued {data.get('type', '').upper()} from \\[{escape(data.get('tabId', current_tab_id))}\\]")
+                state.add_log(f"📥 Queued {data.get('type', '').upper()} from \\[{escape(data.get('tabId', current_tab_id or 'unknown'))}\\]")
                 render_event.set()
 
     except Exception:
         pass
     finally:
-        state.tabs.pop(current_tab_id, None)
-        state.add_log(f"⚪ [dim]Chrome tab closed: \\[{escape(current_tab_id)}\\][/dim]")
-        render_event.set()
+        if current_tab_id:
+            state.tabs.pop(current_tab_id, None)
+            state.add_log(f"⚪ [dim]Chrome tab closed: \\[{escape(current_tab_id)}\\][/dim]")
+            if state.tabs:
+                state.selected_tab_idx = max(0, min(state.selected_tab_idx, len(state.tabs) - 1))
+            else:
+                state.selected_tab_idx = 0
+            render_event.set()
         writer.close()
         await writer.wait_closed()
 
@@ -363,7 +380,7 @@ def render_tui(height: int) -> Layout:
 
     tabs_table = Table.grid(padding=(0, 1))
     tabs_table.add_row(*tab_cells)
-    layout["tabs_bar"].update(Panel(tabs_table, title=f"[bold]Active Chrome Tabs[/bold] [dim](\\[1-9\\] / \\[h/l\\] Switch)[/dim]", border_style="dim"))
+    layout["tabs_bar"].update(Panel(tabs_table, title="[bold]Active Chrome Tabs[/bold] [dim](\\[1-9\\] / \\[h/l\\] Switch)[/dim]", border_style="dim"))
 
     # 3. Main Stream View for Selected Tab
     selected_tab = state.get_selected_tab()
@@ -395,6 +412,12 @@ def render_tui(height: int) -> Layout:
                     code_preview = "\n".join(lines) + ("\n..." if len(code.splitlines()) > 6 else "")
                     elements.append(Panel(Text(code_preview, style="yellow"), border_style="yellow"))
 
+        # Real-time Composer Preview if text is being typed/buffered in prompt box
+        if selected_tab.prompt_text:
+            elements.append(Text("✍️ PROMPT BOX (LIVE STREAM):", style="bold cyan"))
+            p_text = (selected_tab.prompt_text[:300] + "...") if len(selected_tab.prompt_text) > 300 else selected_tab.prompt_text
+            elements.append(Panel(Text(p_text, style="italic cyan"), border_style="cyan"))
+
         view_content = Group(*elements)
 
     curr_title = selected_tab.title if selected_tab else "No Tab"
@@ -413,7 +436,7 @@ def render_tui(height: int) -> Layout:
     layout["bottom_bar"].update(
         Panel(
             Group(Text.from_markup(exec_banner), *log_texts),
-            title=f"[bold]Central Queue & Logs[/bold] [dim](\\[q\\] Quit, \\[h/l\\] Tabs)[/dim]",
+            title="[bold]Central Queue & Logs[/bold] [dim](\\[q\\] Quit, \\[h/l\\] Tabs)[/dim]",
             border_style="dim",
         )
     )

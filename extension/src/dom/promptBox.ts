@@ -35,12 +35,14 @@ export const getPromptBoxStatus = (): PromptBoxStatus => {
     "mat-progress-spinner, mat-spinner, .mat-mdc-progress-spinner, ms-run-button .spinner"
   );
   const isAiPrinting = hasStop || hasSpinner;
-  const charCount = textarea?.value?.length ?? 0;
+  const promptText = textarea?.value ?? "";
+  const charCount = promptText.length;
   const isButtonDisabled = runBtn?.getAttribute("aria-disabled") === "true" || !!runBtn?.disabled;
 
   return {
     hasText: charCount > 0,
     charCount,
+    promptText,
     buttonLabel: isAiPrinting ? "Stop" : rawLabel.split("\n")[0] || "Run",
     isButtonDisabled,
     isAiPrinting,
@@ -56,7 +58,6 @@ export const submitPrompt = async (text: string): Promise<boolean> => {
 
   setAngularValue(promptInput, text);
 
-  // Wait up to 350ms for Angular to enable the submit button
   const runBtn =
     (await waitFor(
       () => {
@@ -76,7 +77,6 @@ export const submitPrompt = async (text: string): Promise<boolean> => {
     if (!promptInput.value || promptInput.value !== text) return true;
   }
 
-  // Hotkey dispatch fallback
   promptInput.dispatchEvent(
     new KeyboardEvent("keydown", {
       key: "Enter",

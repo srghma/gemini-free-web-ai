@@ -15,12 +15,17 @@ export class BridgeWebSocket {
   private isReconnecting = false;
   private retryDelayMs = 2000;
   private pendingQueue: QueuedTask[] = [];
+  private onSelectVariantHandler: ((variantIndex: number) => void) | null = null;
 
   constructor(
     private statusBadge: StatusBadgeManager,
     private tabId: string
   ) {
     this.connect();
+  }
+
+  public onSelectVariant(handler: (variantIndex: number) => void): void {
+    this.onSelectVariantHandler = handler;
   }
 
   private connect(): void {
@@ -48,14 +53,22 @@ export class BridgeWebSocket {
 
     this.socket.onmessage = async (event: MessageEvent) => {
       try {
-        const data: DaemonExecutionResponse = JSON.parse(event.data);
-        if (data.status === "running") {
-          this.statusBadge.setRunning(data.type, data.timeout);
+        const data = JSON.parse(event.data);
+
+        if (data.command === "select_variant") {
+          const idx = typeof data.variantIndex === "number" ? data.variantIndex : 0;
+          this.onSelectVariantHandler?.(idx);
           return;
         }
 
-        this.statusBadge.setFinished(data.type, data.exitCode ?? 0, data.output || "");
-        await submitPrompt(formatExecutionReply(data));
+        const execResp = data as DaemonExecutionResponse;
+        if (execResp.status === "running") {
+          this.statusBadge.setRunning(execResp.type, execResp.timeout);
+          return;
+        }
+
+        this.statusBadge.setFinished(execResp.type, execResp.exitCode ?? 0, execResp.output || "");
+        await submitPrompt(formatExecutionReply(execResp));
       } catch (err) {
         console.error("[Bridge] Failed parsing daemon message:", err);
       }
