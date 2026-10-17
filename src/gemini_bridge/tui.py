@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import select
 import sys
@@ -14,6 +15,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 from .models import ServerState, TabSession
+from .transport import make_ws_frame
 
 console = Console()
 
@@ -27,7 +29,7 @@ def get_char_nonblocking(fd: int, timeout: float = 0.2) -> str | None:
     return None
 
 def render_chat_view(selected_tab: TabSession | None, width: int, height: int) -> Panel:
-    if not selected_tab or not selected_tab.turns:
+    if not selected_tab or (not selected_tab.turns and not selected_tab.pending_variant_choice):
         return Panel(
             Text("\n\n  Waiting for chat activity in this tab...", style="dim italic"),
             title="[bold cyan]Chat View[/bold cyan]",
@@ -63,12 +65,19 @@ def render_chat_view(selected_tab: TabSession | None, width: int, height: int) -
                 syntax = Syntax(cb.code, lang, theme="monokai", line_numbers=True, word_wrap=True)
                 elements.append(Panel(syntax, title=f"⚡ PAYLOAD: {lang.upper()}", border_style="yellow"))
 
-    if selected_tab.preference_vote:
-        vote = selected_tab.preference_vote
-        vote_lines = [f"[bold yellow]⚖️ Preference Vote Pending ({len(vote.options)} options)[/bold yellow]"]
-        for opt in vote.options:
-            vote_lines.append(f"  • Option {opt.index + 1} ({opt.side}): {opt.text[:80]}...")
-        elements.append(Panel(Text.from_markup("\n".join(vote_lines)), title="⚖️ PREFERENCE VOTE", border_style="yellow"))
+    if selected_tab.pending_variant_choice:
+        vote = selected_tab.pending_variant_choice
+        v_title = "[bold yellow blink]⚖️ A/B PREFERENCE VOTE PENDING - ACTION REQUIRED[/bold yellow blink]"
+        v_lines = [f"[bold yellow]{vote.question}[/bold yellow]"]
+        v_lines.append("[bold cyan]Press [v] followed by [1] or [2] to select candidate:[/bold cyan]\n")
+
+        for idx, opt in enumerate(vote.options):
+            preview = opt.text.strip()
+            if len(preview) > 300:
+                preview = preview[:300] + "..."
+            v_lines.append(f"[bold green][{idx + 1}] Option {idx + 1} ({opt.side.upper()}):[/bold green]\n{preview}\n")
+
+        elements.append(Panel(Text.from_markup("\n".join(v_lines)), title=v_title, border_style="yellow"))
 
     inner_width = max(20, width - 4)
     inner_height = max(5, height - 2)
@@ -140,7 +149,7 @@ def render_tui(height: int, state: ServerState, execution_queue: asyncio.Queue) 
     else:
         for idx, tab in enumerate(tab_list):
             is_active = idx == state.selected_tab_idx
-            status_ico = "✍" if tab.is_printing else "⏸"
+            status_ico = "⚖️" if tab.pending_variant_choice else ("✍" if tab.is_printing else "⏸")
             title = (tab.title[:10] + "…") if len(tab.title) > 10 else tab.title
 
             cell_text = f"[{idx + 1}] {tab.tab_id} ({title}) {status_ico}"
@@ -161,9 +170,11 @@ def render_tui(height: int, state: ServerState, execution_queue: asyncio.Queue) 
             f"[bold yellow]▶ ACTIVE: {step_str}{cur_task['lang'].upper()} on {task_tab}[/bold yellow]\n"
             f"[dim]Running for {time.time() - cur_task['start']:.1f}s (timeout: {cur_task['timeout']:.0f}s)[/dim]"
         )
+    elif selected_tab and selected_tab.pending_variant_choice:
+        exec_banner = "[bold yellow blink]⚖️ Awaiting Variant Selection (Press v then 1/2)[/bold yellow blink]"
     else:
         exec_banner = "[dim]Queue idle - waiting for tasks[/dim]"
-    layout["sidebar"]["active_task"].update(Panel(Text.from_markup(exec_banner), title="[bold]Active Task[/bold]", border_style="yellow" if cur_task else "dim"))
+    layout["sidebar"]["active_task"].update(Panel(Text.from_markup(exec_banner), title="[bold]Active Task[/bold]", border_style="yellow" if (cur_task or (selected_tab and selected_tab.pending_variant_choice)) else "dim"))
 
     if selected_tab and selected_tab.prompt_text:
         p_text = (selected_tab.prompt_text[:120] + "...") if len(selected_tab.prompt_text) > 120 else selected_tab.prompt_text
@@ -176,12 +187,16 @@ def render_tui(height: int, state: ServerState, execution_queue: asyncio.Queue) 
     log_texts = [Text.from_markup(l) for l in log_lines] or [Text("Waiting for events...", style="dim")]
     layout["sidebar"]["logs"].update(Panel(Group(*log_texts), title="[bold]Central Queue & Logs[/bold]", border_style="dim"))
 
-    nav_hint = escape("[q] Quit │ [1-9]/[h/l] Tabs │ [j/k]/[↑/↓] Scroll │ [G] Bottom")
+    if state.awaiting_vote_selection:
+        nav_hint = escape("[1] Pick Option 1 │ [2] Pick Option 2 │ [Esc] Cancel Vote Selection")
+    else:
+        nav_hint = escape("[q] Quit │ [e] Export JSON │ [v] Vote Variant │ [1-9]/[h/l] Tabs │ [j/k] Scroll")
     layout["sidebar"]["footer"].update(Panel(Text.from_markup(f"[dim]{nav_hint}[/dim]"), border_style="dim"))
 
     return layout
 
 async def key_listener(state: ServerState, render_event: asyncio.Event):
+    from .orchestrator import apply_user_variant_choice
     loop = asyncio.get_running_loop()
     fd = sys.stdin.fileno()
     is_tty = os.isatty(fd)
@@ -203,12 +218,52 @@ async def key_listener(state: ServerState, render_event: asyncio.Event):
             tabs_count = len(state.tabs)
             cur_tab = state.get_selected_tab()
 
-            # Arrow keys & Escape sequences
-            if ch in ("\x1b[C", "l", "L", "\t"):
+            # Handle variant voting mode
+            if state.awaiting_vote_selection:
+                if ch == "1":
+                    if cur_tab and cur_tab.pending_variant_choice:
+                        apply_user_variant_choice(cur_tab, 0)
+                    state.awaiting_vote_selection = False
+                elif ch == "2":
+                    if cur_tab and cur_tab.pending_variant_choice:
+                        apply_user_variant_choice(cur_tab, 1)
+                    state.awaiting_vote_selection = False
+                elif ch in ("", "q", "c"):
+                    state.awaiting_vote_selection = False
+                render_event.set()
+                continue
+
+            # Toggle variant voting mode
+            if ch in ("v", "V"):
+                if cur_tab and cur_tab.pending_variant_choice:
+                    state.awaiting_vote_selection = True
+                    state.add_log("⚖️ [bold yellow]Select variant: press [1] for Option 1, [2] for Option 2[/bold yellow]")
+                else:
+                    state.add_log("[dim]No pending variant vote on current tab[/dim]")
+                render_event.set()
+                continue
+
+            # Export JSON
+            if ch in ("e", "E"):
+                if cur_tab and cur_tab.writer:
+                    try:
+                        msg = json.dumps({"command": "trigger_export", "tabId": cur_tab.tab_id})
+                        cur_tab.writer.write(make_ws_frame(msg))
+                        asyncio.create_task(cur_tab.writer.drain())
+                        state.add_log(f"📥 Requested export for [{cur_tab.tab_id}]")
+                    except Exception as err:
+                        state.add_log(f"[red]Failed triggering export: {escape(str(err))}[/red]")
+                else:
+                    state.add_log("[dim]Cannot export: no active tab connection[/dim]")
+                render_event.set()
+                continue
+
+            # Tab navigation
+            if ch in ("[C", "l", "L", "	"):
                 if tabs_count:
                     state.user_manually_selected = True
                     state.selected_tab_idx = (state.selected_tab_idx + 1) % tabs_count
-            elif ch in ("\x1b[D", "h", "H", "\x7f"):
+            elif ch in ("[D", "h", "H", ""):
                 if tabs_count:
                     state.user_manually_selected = True
                     state.selected_tab_idx = (state.selected_tab_idx - 1) % tabs_count
@@ -217,34 +272,34 @@ async def key_listener(state: ServerState, render_event: asyncio.Event):
                 state.selected_tab_idx = int(ch) - 1
 
             # Up / Down Scrolling
-            elif ch in ("\x1b[A", "k", "K"):
+            elif ch in ("[A", "k", "K"):
                 if cur_tab:
                     cur_tab.follow_bottom = False
                     cur_tab.scroll_offset += 4
-            elif ch in ("\x1b[B", "j", "J"):
+            elif ch in ("[B", "j", "J"):
                 if cur_tab:
                     cur_tab.scroll_offset = max(0, cur_tab.scroll_offset - 4)
                     if cur_tab.scroll_offset == 0:
                         cur_tab.follow_bottom = True
-            elif ch in ("u", "U", "\x1b[5~"):  # Page up
+            elif ch in ("u", "U", "[5~"):
                 if cur_tab:
                     cur_tab.follow_bottom = False
                     cur_tab.scroll_offset += 16
-            elif ch in ("d", "D", "\x1b[6~"):  # Page down
+            elif ch in ("d", "D", "[6~"):
                 if cur_tab:
                     cur_tab.scroll_offset = max(0, cur_tab.scroll_offset - 16)
                     if cur_tab.scroll_offset == 0:
                         cur_tab.follow_bottom = True
-            elif ch in ("g", "\x1b[H"):        # Top
+            elif ch in ("g", "[H"):
                 if cur_tab:
                     cur_tab.follow_bottom = False
                     cur_tab.scroll_offset = 99999
-            elif ch in ("G", "\x1b[F"):        # Bottom
+            elif ch in ("G", "[F"):
                 if cur_tab:
                     cur_tab.scroll_offset = 0
                     cur_tab.follow_bottom = True
 
-            elif ch in ("q", "Q", "\x03", "\x04"):
+            elif ch in ("q", "Q", "", ""):
                 state.stop_requested = True
                 render_event.set()
                 break

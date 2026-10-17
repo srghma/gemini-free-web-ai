@@ -16,18 +16,30 @@
 
   type XHRWithUrl = XMLHttpRequest & { _url?: string | URL };
 
-  XMLHttpRequest.prototype.open = function (
+  const patchOpen = function (
     this: XHRWithUrl,
     method: string,
     url: string | URL,
-    async = true,
+    async?: boolean,
     username?: string | null,
     password?: string | null
   ): void {
     this._url = url;
-    const fn = origOpen as (...args: unknown[]) => void;
-    fn.apply(this, [method, url, async, username, password]);
+    if (typeof async === "boolean") {
+      const fn = origOpen as (
+        m: string,
+        u: string | URL,
+        a: boolean,
+        un?: string | null,
+        pw?: string | null
+      ) => void;
+      fn.call(this, method, url, async, username, password);
+    } else {
+      const fn = origOpen as (m: string, u: string | URL) => void;
+      fn.call(this, method, url);
+    }
   };
+  XMLHttpRequest.prototype.open = patchOpen as typeof XMLHttpRequest.prototype.open;
 
   XMLHttpRequest.prototype.send = function (
     this: XHRWithUrl,
@@ -37,6 +49,7 @@
 
     if (/MakerSuiteService\/GenerateContent/i.test(url)) {
       let parsedBody: unknown = null;
+      let lastText = "";
 
       try {
         if (typeof body === "string") {
@@ -61,35 +74,40 @@
         })
       );
 
-      this.addEventListener("progress", () => {
-        const text = this.responseText || "";
-        window.dispatchEvent(
-          new CustomEvent("gemini_generation_progress", {
-            detail: {
-              length: text.length,
-              tail: text.slice(-400),
-            },
-          })
-        );
+      const cacheChunk = () => {
+        if (this.responseText && this.responseText.length >= lastText.length) {
+          lastText = this.responseText;
+        }
+      };
+
+      this.addEventListener("progress", cacheChunk);
+
+      const notifyFinished = () => {
+        if (lastText.length === 0 && this.responseText) {
+          lastText = this.responseText;
+        }
+        if (lastText.length > 0) {
+          window.dispatchEvent(
+            new CustomEvent("gemini_generation_end", {
+              detail: {
+                model: latestRequestModel,
+                fullResponse: lastText,
+                requestPayload: latestRequestPayload,
+              },
+            })
+          );
+          lastText = "";
+        }
+      };
+
+      this.addEventListener("readystatechange", () => {
+        if (this.readyState === 3) cacheChunk();
+        if (this.readyState === 0 || this.readyState === 4) notifyFinished();
       });
 
-      this.addEventListener("load", () => {
-        const fullResponse = this.responseText || "";
-        window.dispatchEvent(
-          new CustomEvent("gemini_generation_end", {
-            detail: {
-              model: latestRequestModel,
-              fullResponse,
-              requestPayload: latestRequestPayload,
-            },
-          })
-        );
-      });
-
+      this.addEventListener("abort", notifyFinished);
+      this.addEventListener("loadend", notifyFinished);
       this.addEventListener("error", () => {
-        window.dispatchEvent(new CustomEvent("gemini_generation_error"));
-      });
-      this.addEventListener("abort", () => {
         window.dispatchEvent(new CustomEvent("gemini_generation_error"));
       });
     }

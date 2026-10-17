@@ -9,7 +9,12 @@ from rich.markup import escape
 from rich.live import Live
 
 from .models import TabSession, render_event, state
-from .orchestrator import batch_queue_worker, check_and_dispatch_settled_turns, execution_queue, handle_preference_vote
+from .orchestrator import (
+    batch_queue_worker,
+    check_and_dispatch_settled_turns,
+    execution_queue,
+    handle_preference_vote,
+)
 from .transport import (
     HOST,
     LOCK_FILE_PATH,
@@ -67,6 +72,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 current_tab_id = data.get("tabId")
                 if current_tab_id:
                     session = state.tabs.setdefault(current_tab_id, TabSession(tab_id=current_tab_id))
+                    session.writer = writer
                     session.title = data.get("title", "Chat")
                     session.prompt_text = data.get("promptText", "")
                     session.button_label = data.get("buttonLabel", "Run")
@@ -87,15 +93,22 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 if not tab_id:
                     continue
                 session = state.tabs.setdefault(tab_id, TabSession(tab_id=tab_id))
-                session.is_printing = data.get("isPrinting", False)
-                session.button_label = data.get("buttonLabel", "Run")
-                session.prompt_text = data.get("promptText", "")
+                session.writer = writer
+                if "isPrinting" in data:
+                    session.is_printing = data.get("isPrinting", False)
+                if "buttonLabel" in data:
+                    session.button_label = data.get("buttonLabel", "Run")
+                if "promptText" in data:
+                    session.prompt_text = data.get("promptText", "")
                 session.last_seen = datetime.now()
 
-                raw_turns = data.get("turns", [])
-                session.merge_turns(raw_turns)
+                raw_turns = data.get("turns")
+                if raw_turns is not None:
+                    session.merge_turns(raw_turns)
 
-                handle_preference_vote(session, data.get("preferenceVote"), writer)
+                if "preferenceVote" in data:
+                    handle_preference_vote(session, data.get("preferenceVote"), writer)
+
                 check_and_dispatch_settled_turns(session, writer)
 
                 if not state.user_manually_selected and session.turns:

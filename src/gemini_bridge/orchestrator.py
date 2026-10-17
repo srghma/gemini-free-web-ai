@@ -1,11 +1,19 @@
 import asyncio
 import json
-import random
 import time
 from rich.markup import escape
 from .executor import execute_task, parse_timeout
 from .formatter import format_execution_reply, group_replies
-from .models import ChatTurn, PreferenceOption, PreferenceVote, ServerState, TabSession, render_event, state
+from .models import (
+    ChatTurn,
+        PreferenceOption,
+    PreferenceVote,
+    ServerState,
+    TabSession,
+    extract_fenced_code_blocks,
+    render_event,
+    state,
+)
 from .parser import ParsedCommand, extract_commands_from_turn
 from .transport import log_raw_ws, log_to_file, make_ws_frame
 
@@ -17,13 +25,20 @@ class CommandBatch:
 
 execution_queue: asyncio.Queue[CommandBatch] = asyncio.Queue()
 
-# Track when a turn was last updated to ensure 1.8s quiescence before execution
-_turn_stability: dict[str, float] = {}
-_turn_content_hashes: dict[str, str] = {}
+async def trigger_desktop_notification(title: str, body: str):
+    try:
+        proc = await asyncio.create_subprocess_exec("notify-send", "-u", "critical", title, body)
+        await proc.wait()
+    except Exception:
+        pass
 
 async def batch_queue_worker():
     while not state.stop_requested:
         batch = await execution_queue.get()
+        if not batch or not isinstance(batch, CommandBatch):
+            execution_queue.task_done()
+            continue
+
         tab_id = batch.tab_id
         writer = batch.writer
         total = len(batch.commands)
@@ -101,9 +116,10 @@ async def batch_queue_worker():
         render_event.set()
         execution_queue.task_done()
 
-def handle_preference_vote(session: TabSession, vote_dict: dict, writer: asyncio.StreamWriter):
+def handle_preference_vote(session: TabSession, vote_dict: dict | None, writer: asyncio.StreamWriter):
     if not vote_dict:
         session.preference_vote = None
+        session.pending_variant_choice = None
         return
 
     options = [
@@ -117,45 +133,84 @@ def handle_preference_vote(session: TabSession, vote_dict: dict, writer: asyncio
         is_submit_disabled=vote_dict.get("isSubmitDisabled", False),
     )
     session.preference_vote = vote
+    session.pending_variant_choice = vote
 
     vote_key = f"{len(options)}_{options[0].text[:30] if options else ''}"
     if vote_key in session.handled_vote_keys:
         return
 
     session.handled_vote_keys.add(vote_key)
-    chosen_idx = random.choice([0, 1]) if len(options) > 1 else 0
     tab_tag = escape(f"[{session.tab_id}]")
-    state.add_log(f"⚖️ [bold yellow]Preference vote detected for {tab_tag}! Auto-selecting Variant #{chosen_idx + 1}[/bold yellow]")
+    state.add_log(f"⚖️ [bold yellow]A/B Variant Choice Required for {tab_tag}! Press [v] in TUI to select.[/bold yellow]")
 
+    asyncio.create_task(
+        trigger_desktop_notification(
+            "Gemini Bridge: A/B Choice Required",
+            f"Select Variant [1] or [2] in TUI for tab {session.tab_id}"
+        )
+    )
+    render_event.set()
+
+def apply_user_variant_choice(session: TabSession, variant_idx: int):
+    if not session.pending_variant_choice or not session.writer:
+        return
+
+    opts = session.pending_variant_choice.options
+    if variant_idx < 0 or variant_idx >= len(opts):
+        return
+
+    chosen_opt = opts[variant_idx]
+    chosen_text = chosen_opt.text
+    tab_tag = escape(f"[{session.tab_id}]")
+    state.add_log(f"⚖️ [bold cyan]User selected Variant #{variant_idx + 1} ({chosen_opt.side}) for {tab_tag}[/bold cyan]")
+
+    # 1. Inform extension to click button in Google AI Studio
     try:
-        msg = json.dumps({"command": "select_variant", "tabId": session.tab_id, "variantIndex": chosen_idx})
-        writer.write(make_ws_frame(msg))
-        asyncio.create_task(writer.drain())
+        msg = json.dumps({
+            "command": "select_variant",
+            "tabId": session.tab_id,
+            "variantIndex": variant_idx,
+            "selectedText": chosen_text,
+        })
+        session.writer.write(make_ws_frame(msg))
+        asyncio.create_task(session.writer.drain())
         log_raw_ws("SEND", session.tab_id, msg)
     except Exception as e:
         state.add_log(f"[red]Failed sending select_variant: {escape(str(e))}[/red]")
+
+    # 2. Append/commit turn locally
+    turn_id = f"net_turn_{len(session.turns)}"
+    committed_turn = ChatTurn(
+        id=turn_id,
+        type="ai_chat",
+        status="completed",
+        chat_content=chosen_text,
+        code_blocks=extract_fenced_code_blocks(chosen_text),
+    )
+    session.turns.append(committed_turn)
+    session.handled_turn_ids.add(turn_id)
+
+    # 3. Clear pending vote
+    session.pending_variant_choice = None
+    session.preference_vote = None
+
+    # 4. Check for EXECUTE_NEXT_* commands in selected variant
+    commands = extract_commands_from_turn(committed_turn)
+    if commands:
+        state.add_log(f"📥 Found [cyan]{len(commands)}[/cyan] command(s) in selected variant for {tab_tag}")
+        execution_queue.put_nowait(CommandBatch(session.tab_id, session.writer, commands))
+    else:
+        state.add_log(f"✓ No execution triggers in selected variant for {tab_tag}")
+
     render_event.set()
 
 def check_and_dispatch_settled_turns(session: TabSession, writer: asyncio.StreamWriter):
-    if session.is_printing or not session.turns:
+    # In pure network mode, session.is_printing is false ONLY when XHR has finished completely
+    if session.is_printing or not session.turns or session.pending_variant_choice:
         return
 
     latest_turn = session.turns[-1]
     if latest_turn.type == "user" or latest_turn.id in session.handled_turn_ids:
-        return
-
-    # Check turn content stability
-    content_fingerprint = f"{len(latest_turn.chat_content)}:{len(latest_turn.code_blocks)}:{[len(cb.code) for cb in latest_turn.code_blocks]}"
-    now = time.time()
-
-    if _turn_content_hashes.get(latest_turn.id) != content_fingerprint:
-        _turn_content_hashes[latest_turn.id] = content_fingerprint
-        _turn_stability[latest_turn.id] = now
-        return
-
-    stable_duration = now - _turn_stability.get(latest_turn.id, now)
-    # Require turn to be completely unchanged for >= 1.8s and completed
-    if stable_duration < 1.8 and latest_turn.status != "completed":
         return
 
     commands = extract_commands_from_turn(latest_turn)
@@ -163,6 +218,6 @@ def check_and_dispatch_settled_turns(session: TabSession, writer: asyncio.Stream
 
     if commands:
         tab_tag = escape(f"[{session.tab_id}]")
-        state.add_log(f"📥 Found [cyan]{len(commands)}[/cyan] command(s) in settled turn {latest_turn.id[-6:]} for {tab_tag}")
+        state.add_log(f"📥 Found [cyan]{len(commands)}[/cyan] command(s) in turn {latest_turn.id[-6:]} for {tab_tag}")
         execution_queue.put_nowait(CommandBatch(session.tab_id, writer, commands))
         render_event.set()

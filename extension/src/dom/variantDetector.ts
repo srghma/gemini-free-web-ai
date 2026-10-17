@@ -68,7 +68,6 @@ export const clickVariantChoice = async (index: number): Promise<boolean> => {
     return true;
   }
 
-  // Fallback to skip button if submit is not clickable
   const skipBtn = voteEl.querySelector<HTMLButtonElement>('button[data-test-id="skip-button"]');
   if (skipBtn) {
     skipBtn.click();

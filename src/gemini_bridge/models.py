@@ -2,6 +2,7 @@ import asyncio
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
+import re
 
 @dataclass
 class CodeBlock:
@@ -31,6 +32,18 @@ class ChatTurn:
     chat_content: str = ""
     code_blocks: list[CodeBlock] = field(default_factory=list)
 
+def extract_fenced_code_blocks(text: str) -> list[CodeBlock]:
+    if not text:
+        return []
+    pattern = re.compile(r"```([a-zA-Z0-9_-]+)?\s*[\r\n]+([\s\S]*?)[\r\n]+```")
+    blocks: list[CodeBlock] = []
+    for m in pattern.finditer(text):
+        lang = (m.group(1) or "bash").lower()
+        code = m.group(2).strip()
+        if code:
+            blocks.append(CodeBlock(language=lang, code=code))
+    return blocks
+
 @dataclass
 class TabSession:
     tab_id: str
@@ -39,6 +52,8 @@ class TabSession:
     button_label: str = "Run"
     prompt_text: str = ""
     preference_vote: PreferenceVote | None = None
+    pending_variant_choice: PreferenceVote | None = None
+    writer: asyncio.StreamWriter | None = None
     turns: list[ChatTurn] = field(default_factory=list)
     last_seen: datetime = field(default_factory=datetime.now)
     scroll_offset: int = 0
@@ -50,7 +65,12 @@ class TabSession:
         if not raw_turns:
             return
 
-        turn_order: list[str] = [t.id for t in self.turns]
+        # If incoming turns represent full history starting at index 0, adopt authoritative incoming order
+        if raw_turns and (raw_turns[0].get("id") == "net_turn_0" or len(raw_turns) >= len(self.turns)):
+            turn_order: list[str] = []
+        else:
+            turn_order = [t.id for t in self.turns]
+
         turns_map: dict[str, ChatTurn] = {t.id: t for t in self.turns}
 
         for rt in raw_turns:
@@ -71,6 +91,9 @@ class TabSession:
             new_chat = (rt.get("chatContent") or "").strip()
             new_type = rt.get("type", "ai_chat")
             new_status = rt.get("status", "completed")
+
+            if not cbs and new_chat:
+                cbs = extract_fenced_code_blocks(new_chat)
 
             existing = turns_map.get(tid)
 
@@ -107,6 +130,7 @@ class ServerState:
         self.tasks_failed = 0
         self.current_executing_task: dict | None = None
         self.stop_requested = False
+        self.awaiting_vote_selection = False
 
     @property
     def tab_list(self) -> list[TabSession]:
