@@ -9,7 +9,7 @@
     domTimeoutMs: 7000,
   });
 
-  const TARGET_CONTENT = `This page has injected chrome extension from ~/projects/gemini-free-web-ai/{content.js,...other extension files,server.py}
+  const TARGET_CONTENT = `This page has injected chrome extension from ~/projects/gemini-free-web-ai/{extension/{content.js,manifest.json},server.py,executor.py}
 
 Also server.py is running as daemon on machine of user and at http://127.0.0.1:8765
 
