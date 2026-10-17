@@ -3,6 +3,10 @@
   "name": "Gemini Free Web AI Controller",
   "version": "1.2.0",
   "description": "Bridge Google AI Studio directly to local execution daemon",
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
   "content_scripts": [
     {
       "matches": [

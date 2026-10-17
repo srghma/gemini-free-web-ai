@@ -7,6 +7,21 @@ export interface ParsedCommand {
   rawType: string;
 }
 
+export interface ExtractedCodeBlock {
+  language: string;
+  code: string;
+}
+
+export interface ExtractedTurn {
+  id: string;
+  type: "user" | "ai_thinking" | "ai_chat" | "ai_both";
+  status: "streaming" | "completed";
+  userContent?: string;
+  thinkingContent?: string;
+  chatContent?: string;
+  codeBlocks: ExtractedCodeBlock[];
+}
+
 export interface DaemonExecutionResponse {
   status: "completed" | "error" | "timeout" | "running";
   type: CommandLanguage;

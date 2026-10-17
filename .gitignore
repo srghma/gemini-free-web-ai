@@ -1,2 +1,3 @@
 __pycache__/
 bridge_execution.log
+bridge_websocket_raw.log

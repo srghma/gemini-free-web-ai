@@ -1,7 +1,7 @@
 import { CONFIG } from "../config";
-import type { ExtractedTurn } from "../dom/chatExtractor";
 import { submitPrompt } from "../dom/promptBox";
 import { formatExecutionReply } from "../execution/formatter";
+import type { ExtractedTurn } from "../types";
 import type { DaemonExecutionResponse, PromptBoxStatus } from "../types";
 import type { StatusBadgeManager } from "../ui/statusBadge";
 

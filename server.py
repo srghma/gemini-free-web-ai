@@ -13,20 +13,22 @@ from datetime import datetime
 import hashlib
 import json
 import os
+import sys
 import time
 
 from rich.markup import escape
 from rich.live import Live
 
 from executor import execute_task, parse_timeout
-from models import ChatTurn, TabSession, execution_queue, render_event, state
+from models import TabSession, execution_queue, render_event, state
 from tui import console, key_listener, render_tui
 from ws_transport import (
     HOST,
     LOCK_FILE_PATH,
     PORT,
     WS_GUID,
-    acquire_singleton_lock,
+    WatcherLock,
+    log_raw_ws,
     log_to_file,
     make_ws_frame,
     read_ws_frame,
@@ -47,10 +49,13 @@ async def queue_worker():
         render_event.set()
 
         log_to_file(f"EXECUTE [{tab_id}] {lang.upper()} (timeout: {timeout}s)\n--- CODE ---\n{code}\n--- END CODE ---")
+        log_raw_ws("EVENT", tab_id, f"TASK_START: {lang.upper()} (timeout: {timeout}s)")
 
         try:
-            writer.write(make_ws_frame(json.dumps({"status": "running", "type": lang, "timeout": f"{timeout}s"})))
+            running_frame = json.dumps({"status": "running", "type": lang, "timeout": f"{timeout}s"})
+            writer.write(make_ws_frame(running_frame))
             await writer.drain()
+            log_raw_ws("SEND", tab_id, running_frame)
         except Exception:
             pass
 
@@ -78,12 +83,15 @@ async def queue_worker():
         }
 
         try:
-            writer.write(make_ws_frame(json.dumps(response)))
+            resp_frame = json.dumps(response)
+            writer.write(make_ws_frame(resp_frame))
             await writer.drain()
+            log_raw_ws("SEND", tab_id, resp_frame)
         except Exception as e:
             state.add_log(f"[red]Client disconnected before delivery: {escape(str(e))}[/red]")
 
         log_to_file(f"RESULT [{tab_id}] {response['status']} (Exit {res.exit_code}) in {elapsed:.2f}s\n--- OUTPUT ---\n{res.output}\n--- END OUTPUT ---\n")
+        log_raw_ws("EVENT", tab_id, f"TASK_END: {response['status']} in {elapsed:.2f}s (Exit {res.exit_code})")
         state.add_log(f"{status_tag} {tab_tag} {lang.upper()} in {elapsed:.2f}s")
         render_event.set()
         execution_queue.task_done()
@@ -113,6 +121,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     await writer.drain()
 
     current_tab_id: str | None = None
+    log_raw_ws("CONNECT", "server", "New client TCP connection established")
 
     try:
         while True:
@@ -122,6 +131,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             if not raw_msg:
                 continue
 
+            log_raw_ws("RECV", current_tab_id or "unknown", raw_msg)
             data = json.loads(raw_msg)
             event = data.get("event")
 
@@ -135,19 +145,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     session.last_seen = datetime.now()
 
                     raw_turns = data.get("turns", [])
-                    if raw_turns:
-                        session.turns = [
-                            ChatTurn(
-                                id=t.get("id", ""),
-                                type=t.get("type", "ai_chat"),
-                                status=t.get("status", "completed"),
-                                user_content=t.get("userContent", ""),
-                                thinking_content=t.get("thinkingContent", ""),
-                                chat_content=t.get("chatContent", ""),
-                                code_blocks=t.get("codeBlocks", []),
-                            )
-                            for t in raw_turns
-                        ]
+                    session.merge_turns(raw_turns)
 
                     tab_tag = escape(f"[{current_tab_id}]")
                     state.add_log(f"🟢 [green]Chrome tab connected: {tab_tag} ({escape(session.title)}) - {len(session.turns)} turns[/green]")
@@ -164,18 +162,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 session.last_seen = datetime.now()
 
                 raw_turns = data.get("turns", [])
-                session.turns = [
-                    ChatTurn(
-                        id=t.get("id", ""),
-                        type=t.get("type", "ai_chat"),
-                        status=t.get("status", "completed"),
-                        user_content=t.get("userContent", ""),
-                        thinking_content=t.get("thinkingContent", ""),
-                        chat_content=t.get("chatContent", ""),
-                        code_blocks=t.get("codeBlocks", []),
-                    )
-                    for t in raw_turns
-                ]
+                session.merge_turns(raw_turns)
 
                 if not state.user_manually_selected and session.turns:
                     cur_sel = state.get_selected_tab()
@@ -203,8 +190,10 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 tab_id = data.get("tabId") or current_tab_id
                 tab_tag = escape(f"[{tab_id}]")
                 state.add_log(f"⚖️ [bold yellow]Two variants proposed for {tab_tag}! Auto-selecting Variant 1[/bold yellow]")
-                writer.write(make_ws_frame(json.dumps({"command": "select_variant", "tabId": tab_id, "variantIndex": 0})))
+                msg = json.dumps({"command": "select_variant", "tabId": tab_id, "variantIndex": 0})
+                writer.write(make_ws_frame(msg))
                 await writer.drain()
+                log_raw_ws("SEND", tab_id, msg)
                 render_event.set()
 
             elif "command" in data:
@@ -221,6 +210,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             state.tabs.pop(current_tab_id, None)
             tab_tag = escape(f"[{current_tab_id}]")
             state.add_log(f"⚪ [dim]Chrome tab closed: {tab_tag}[/dim]")
+            log_raw_ws("DISCONNECT", current_tab_id, "Client disconnected")
             if state.tabs:
                 state.selected_tab_idx = max(0, min(state.selected_tab_idx, len(state.tabs) - 1))
             else:
@@ -252,15 +242,14 @@ async def main():
             await server.wait_closed()
 
 if __name__ == "__main__":
-    lock_fd = acquire_singleton_lock()
+    lock = WatcherLock(LOCK_FILE_PATH)
+    if not lock.acquire():
+        holder = lock.get_holder_pid() or "unknown"
+        console.print(f"[bold red]❌ Another instance is already running! (PID: {holder}, Lock: {LOCK_FILE_PATH})[/bold red]")
+        sys.exit(1)
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
-        try:
-            os.close(lock_fd)
-            if LOCK_FILE_PATH.exists():
-                LOCK_FILE_PATH.unlink()
-        except Exception:
-            pass
+        lock.release()

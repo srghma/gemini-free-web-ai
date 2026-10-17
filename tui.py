@@ -9,9 +9,11 @@ from rich.console import Console, Group
 from rich.layout import Layout
 from rich.markup import escape
 from rich.panel import Panel
+from rich.segment import Segment, Segments
+from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
-from models import ServerState
+from models import ServerState, TabSession
 
 console = Console()
 
@@ -27,26 +29,111 @@ def get_key_nonblocking(timeout: float = 0.2) -> str | None:
         pass
     return None
 
+def render_chat_view(selected_tab: TabSession | None, width: int, height: int) -> Panel:
+    if not selected_tab or not selected_tab.turns:
+        return Panel(
+            Text("\n\n  Waiting for chat activity in this tab...", style="dim italic"),
+            title="[bold cyan]Chat View[/bold cyan]",
+            border_style="magenta",
+        )
+
+    elements = []
+    for turn in selected_tab.turns:
+        if turn.type == "user" and turn.user_content:
+            elements.append(
+                Panel(Text(turn.user_content, style="white"), title=f"👤 USER ({turn.id[-6:]})", border_style="cyan")
+            )
+
+        if turn.thinking_content:
+            status_txt = "streaming..." if turn.status == "streaming" else "settled"
+            elements.append(
+                Panel(
+                    Text(turn.thinking_content, style="italic magenta"),
+                    title=f"💭 THINKING ({status_txt})",
+                    border_style="dim magenta",
+                )
+            )
+
+        if turn.chat_content or turn.code_blocks:
+            status_txt = "streaming..." if turn.status == "streaming" else "ready"
+            if turn.chat_content:
+                elements.append(
+                    Panel(Text(turn.chat_content, style="white"), title=f"🤖 AI RESPONSE ({status_txt})", border_style="green")
+                )
+
+            for cb in turn.code_blocks:
+                lang = (cb.language or "bash").lower()
+                syntax = Syntax(cb.code, lang, theme="monokai", line_numbers=True, word_wrap=True)
+                elements.append(Panel(syntax, title=f"⚡ PAYLOAD: {lang.upper()}", border_style="yellow"))
+
+    inner_width = max(20, width - 4)
+    inner_height = max(5, height - 2)
+
+    group = Group(*elements)
+    rendered_lines = list(console.render_lines(group, console.options.update(width=inner_width)))
+    total_lines = len(rendered_lines)
+
+    max_offset = max(0, total_lines - inner_height)
+    offset = 0 if selected_tab.follow_bottom else min(selected_tab.scroll_offset, max_offset)
+
+    if total_lines <= inner_height:
+        visible = rendered_lines
+    elif offset == 0:
+        visible = rendered_lines[-inner_height:]
+    else:
+        start = max(0, total_lines - inner_height - offset)
+        end = max(0, total_lines - offset)
+        visible = rendered_lines[start:end]
+
+    flat = []
+    for line in visible:
+        flat.extend(line)
+        flat.append(Segment.line())
+
+    status_tag = (
+        "[green]▼ Follow Bottom[/green]"
+        if (selected_tab.follow_bottom or offset == 0)
+        else f"[yellow]▲ Scrolled +{offset} lines (G to bottom)[/yellow]"
+    )
+    title = f"[bold cyan]Selected Tab: {escape(selected_tab.title)}[/bold cyan] ({total_lines} lines) • {status_tag}"
+
+    return Panel(Segments(flat), title=title, border_style="magenta")
+
 def render_tui(height: int, state: ServerState, execution_queue: asyncio.Queue) -> Layout:
     layout = Layout()
-    layout.split_column(
-        Layout(name="header", size=3),
-        Layout(name="tabs_bar", size=3),
-        Layout(name="main_view", ratio=3),
-        Layout(name="bottom_bar", size=8),
+    # Left: Chat View (scrollable, follows bottom)
+    # Right: Sidebar (everything else)
+    layout.split_row(
+        Layout(name="chat_view", ratio=6),
+        Layout(name="sidebar", ratio=4),
     )
 
-    # 1. Header
+    layout["sidebar"].split_column(
+        Layout(name="header", size=4),
+        Layout(name="tabs_bar", size=4),
+        Layout(name="active_task", size=4),
+        Layout(name="composer", size=5),
+        Layout(name="logs", ratio=1),
+        Layout(name="footer", size=3),
+    )
+
+    selected_tab = state.get_selected_tab()
+
+    # 1. Chat View (Left)
+    chat_width = max(30, int(console.width * 0.6))
+    layout["chat_view"].update(render_chat_view(selected_tab, chat_width, height))
+
+    # 2. Header
     active_count = len(state.tabs)
     q_depth = execution_queue.qsize()
     header_content = (
-        f"[bold magenta]⚡ GEMINI BRIDGE TUI MULTIPLEXER[/bold magenta] [dim]• ws://127.0.0.1:8765[/dim] "
-        f"│ Tabs: [cyan]{active_count}[/cyan] │ Queue: [yellow]{q_depth}[/yellow] "
-        f"│ Completed: [green]{state.tasks_completed}[/green] │ Failed: [red]{state.tasks_failed}[/red]"
+        f"[bold magenta]⚡ GEMINI BRIDGE TUI MULTIPLEXER[/bold magenta]\n"
+        f"Tabs: [cyan]{active_count}[/cyan] │ Queue: [yellow]{q_depth}[/yellow] "
+        f"│ Done: [green]{state.tasks_completed}[/green] │ Fail: [red]{state.tasks_failed}[/red]"
     )
-    layout["header"].update(Panel(Text.from_markup(header_content), border_style="cyan"))
+    layout["sidebar"]["header"].update(Panel(Text.from_markup(header_content), border_style="cyan"))
 
-    # 2. Tabs Bar
+    # 3. Tabs Bar
     tab_list = state.tab_list
     tab_cells = []
     if not tab_list:
@@ -55,7 +142,7 @@ def render_tui(height: int, state: ServerState, execution_queue: asyncio.Queue) 
         for idx, tab in enumerate(tab_list):
             is_active = idx == state.selected_tab_idx
             status_ico = "✍" if tab.is_printing else "⏸"
-            title = (tab.title[:14] + "…") if len(tab.title) > 14 else tab.title
+            title = (tab.title[:10] + "…") if len(tab.title) > 10 else tab.title
 
             cell_text = f"[{idx + 1}] {tab.tab_id} ({title}) {status_ico}"
             if is_active:
@@ -65,70 +152,33 @@ def render_tui(height: int, state: ServerState, execution_queue: asyncio.Queue) 
 
     tabs_table = Table.grid(padding=(0, 1))
     tabs_table.add_row(*tab_cells)
-    switch_hint = escape("[1-9] / [h/l] Switch")
-    layout["tabs_bar"].update(Panel(tabs_table, title=f"[bold]Active Chrome Tabs[/bold] [dim]({switch_hint})[/dim]", border_style="dim"))
+    layout["sidebar"]["tabs_bar"].update(Panel(tabs_table, title="[bold]Active Chrome Tabs[/bold]", border_style="dim"))
 
-    # 3. Main Stream View
-    selected_tab = state.get_selected_tab()
-    if not selected_tab or not selected_tab.turns:
-        view_content = Text("\n\n  Waiting for chat activity in this tab...", style="dim italic")
-    else:
-        elements = []
-        for turn in selected_tab.turns[-10:]:
-            if turn.type == "user":
-                elements.append(Text(f"👤 USER ({turn.id[-6:]})", style="bold cyan"))
-                user_msg = (turn.user_content[:200] + "...") if len(turn.user_content) > 200 else turn.user_content
-                elements.append(Panel(Text(user_msg or "(empty prompt)", style="white"), border_style="dim cyan"))
-
-            if turn.thinking_content:
-                status_txt = "streaming..." if turn.status == "streaming" else "settled"
-                elements.append(Text(f"💭 THINKING ({status_txt})", style="italic magenta"))
-                t_msg = (turn.thinking_content[:250] + "...") if len(turn.thinking_content) > 250 else turn.thinking_content
-                elements.append(Panel(Text(t_msg, style="dim italic magenta"), border_style="dim magenta"))
-
-            if turn.chat_content or turn.code_blocks:
-                status_txt = "streaming..." if turn.status == "streaming" else "ready"
-                elements.append(Text(f"🤖 AI RESPONSE ({status_txt})", style="bold green"))
-                if turn.chat_content:
-                    c_msg = (turn.chat_content[:300] + "...") if len(turn.chat_content) > 300 else turn.chat_content
-                    elements.append(Panel(Text(c_msg, style="white"), border_style="green"))
-
-                for code in turn.code_blocks:
-                    elements.append(Text("⚡ EXECUTION PAYLOAD:", style="bold yellow"))
-                    lines = code.splitlines()[:6]
-                    code_preview = "\n".join(lines) + ("\n..." if len(code.splitlines()) > 6 else "")
-                    elements.append(Panel(Text(code_preview, style="yellow"), border_style="yellow"))
-
-        # Real-time Composer Preview
-        if selected_tab.prompt_text:
-            elements.append(Text("✍️ PROMPT BOX (LIVE STREAM):", style="bold cyan"))
-            p_text = (selected_tab.prompt_text[:300] + "...") if len(selected_tab.prompt_text) > 300 else selected_tab.prompt_text
-            elements.append(Panel(Text(p_text, style="italic cyan"), border_style="cyan"))
-
-        view_content = Group(*elements)
-
-    curr_title = selected_tab.title if selected_tab else "No Tab"
-    layout["main_view"].update(Panel(view_content, title=f"[bold cyan]Selected Tab: {escape(curr_title)}[/bold cyan]", border_style="magenta"))
-
-    # 4. Bottom Activity & Logs
-    log_lines = list(state.logs)[-5:]
-    log_texts = [Text.from_markup(l) for l in log_lines] or [Text("Waiting for events...", style="dim")]
-
+    # 4. Active Task Banner
     cur_task = state.current_executing_task
     if cur_task:
         task_tab = escape(f"[{cur_task['tab_id']}]")
-        exec_banner = f"[bold yellow]▶ ACTIVE TASK: {cur_task['lang'].upper()} on {task_tab}[/bold yellow] [dim]({time.time() - cur_task['start']:.1f}s)[/dim]"
+        exec_banner = f"[bold yellow]▶ ACTIVE: {cur_task['lang'].upper()} on {task_tab}[/bold yellow]\n[dim]Running for {time.time() - cur_task['start']:.1f}s (timeout: {cur_task['timeout']:.0f}s)[/dim]"
     else:
-        exec_banner = "[dim]Queue idle[/dim]"
+        exec_banner = "[dim]Queue idle - waiting for tasks[/dim]"
+    layout["sidebar"]["active_task"].update(Panel(Text.from_markup(exec_banner), title="[bold]Active Task[/bold]", border_style="yellow" if cur_task else "dim"))
 
-    nav_hint = escape("[q] Quit, [h/l] Tabs")
-    layout["bottom_bar"].update(
-        Panel(
-            Group(Text.from_markup(exec_banner), *log_texts),
-            title=f"[bold]Central Queue & Logs[/bold] [dim]({nav_hint})[/dim]",
-            border_style="dim",
-        )
-    )
+    # 5. Live Composer Preview
+    if selected_tab and selected_tab.prompt_text:
+        p_text = (selected_tab.prompt_text[:120] + "...") if len(selected_tab.prompt_text) > 120 else selected_tab.prompt_text
+        composer_content = Text(f"✍️ ({len(selected_tab.prompt_text)} chars): {p_text}", style="italic cyan")
+    else:
+        composer_content = Text("Prompt box empty", style="dim italic")
+    layout["sidebar"]["composer"].update(Panel(composer_content, title="[bold]Composer Preview (Live)[/bold]", border_style="cyan"))
+
+    # 6. Central Logs
+    log_lines = list(state.logs)[-8:]
+    log_texts = [Text.from_markup(l) for l in log_lines] or [Text("Waiting for events...", style="dim")]
+    layout["sidebar"]["logs"].update(Panel(Group(*log_texts), title="[bold]Central Queue & Logs[/bold]", border_style="dim"))
+
+    # 7. Navigation Footer
+    nav_hint = escape("[q] Quit │ [1-9]/[h/l] Tabs │ [j/k]/[↑/↓] Scroll │ [G] Follow Bottom")
+    layout["sidebar"]["footer"].update(Panel(Text.from_markup(f"[dim]{nav_hint}[/dim]"), border_style="dim"))
 
     return layout
 
@@ -139,19 +189,53 @@ async def key_listener(state: ServerState, render_event: asyncio.Event):
         if not k:
             continue
         tabs_count = len(state.tabs)
-        if k in (K.RIGHT, "l", "L", K.TAB, K.DOWN, "j"):
+        cur_tab = state.get_selected_tab()
+
+        # Tab Switching
+        if k in (K.RIGHT, "l", "L", K.TAB):
             if tabs_count:
                 state.user_manually_selected = True
                 state.selected_tab_idx = (state.selected_tab_idx + 1) % tabs_count
-        elif k in (K.LEFT, "h", "H", K.BACKSPACE, K.UP, "k"):
+        elif k in (K.LEFT, "h", "H", K.BACKSPACE):
             if tabs_count:
                 state.user_manually_selected = True
                 state.selected_tab_idx = (state.selected_tab_idx - 1) % tabs_count
         elif k.isdigit() and 1 <= int(k) <= tabs_count:
             state.user_manually_selected = True
             state.selected_tab_idx = int(k) - 1
+
+        # Chat Scrolling
+        elif k in (K.UP, "k", "K"):
+            if cur_tab:
+                cur_tab.follow_bottom = False
+                cur_tab.scroll_offset += 3
+        elif k in (K.DOWN, "j", "J"):
+            if cur_tab:
+                cur_tab.scroll_offset = max(0, cur_tab.scroll_offset - 3)
+                if cur_tab.scroll_offset == 0:
+                    cur_tab.follow_bottom = True
+        elif k in ("u", "U", K.PAGE_UP):
+            if cur_tab:
+                cur_tab.follow_bottom = False
+                cur_tab.scroll_offset += 12
+        elif k in ("d", "D", K.PAGE_DOWN):
+            if cur_tab:
+                cur_tab.scroll_offset = max(0, cur_tab.scroll_offset - 12)
+                if cur_tab.scroll_offset == 0:
+                    cur_tab.follow_bottom = True
+        elif k in ("g", K.HOME):
+            if cur_tab:
+                cur_tab.follow_bottom = False
+                cur_tab.scroll_offset = 99999
+        elif k in ("G", K.END):
+            if cur_tab:
+                cur_tab.scroll_offset = 0
+                cur_tab.follow_bottom = True
+
+        # Quit
         elif k in ("q", "Q", K.CTRL_C, K.CTRL_D):
             state.stop_requested = True
             render_event.set()
             break
+
         render_event.set()
