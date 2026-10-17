@@ -5,7 +5,7 @@ requires-python = ">=3.11"
 [[package]]
 name = "gemini-free-web-ai"
 version = "0.1.0"
-source = { editable = "." }
+source = { virtual = "." }
 dependencies = [
     { name = "pygments" },
     { name = "readchar" },

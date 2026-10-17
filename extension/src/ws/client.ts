@@ -1,7 +1,8 @@
 import { CONFIG } from "../config";
+import type { ExtractedTurn } from "../dom/chatExtractor";
 import { submitPrompt } from "../dom/promptBox";
 import { formatExecutionReply } from "../execution/formatter";
-import type { DaemonExecutionResponse } from "../types";
+import type { DaemonExecutionResponse, PromptBoxStatus } from "../types";
 import type { StatusBadgeManager } from "../ui/statusBadge";
 
 interface QueuedTask {
@@ -10,12 +11,19 @@ interface QueuedTask {
   timeout: string;
 }
 
+export interface InitialDataPayload {
+  turns: ExtractedTurn[];
+  prompt: PromptBoxStatus;
+}
+
 export class BridgeWebSocket {
   private socket: WebSocket | null = null;
   private isReconnecting = false;
   private retryDelayMs = 2000;
   private pendingQueue: QueuedTask[] = [];
   private onSelectVariantHandler: ((variantIndex: number) => void) | null = null;
+  private initialDataProvider: (() => InitialDataPayload) | null = null;
+  private isManuallyDisabled = false;
 
   constructor(
     private statusBadge: StatusBadgeManager,
@@ -24,11 +32,33 @@ export class BridgeWebSocket {
     this.connect();
   }
 
+  public setInitialDataProvider(provider: () => InitialDataPayload): void {
+    this.initialDataProvider = provider;
+  }
+
   public onSelectVariant(handler: (variantIndex: number) => void): void {
     this.onSelectVariantHandler = handler;
   }
 
+  public disable(): void {
+    this.isManuallyDisabled = true;
+    if (this.socket) {
+      try {
+        this.send({ event: "tab_disconnected", tabId: this.tabId });
+        this.socket.close(1000, "User disabled tab");
+      } catch {}
+      this.socket = null;
+    }
+  }
+
+  public enable(): void {
+    this.isManuallyDisabled = false;
+    this.connect();
+  }
+
   private connect(): void {
+    if (this.isManuallyDisabled) return;
+
     try {
       this.socket = new WebSocket(CONFIG.wsUrl);
     } catch {
@@ -38,14 +68,24 @@ export class BridgeWebSocket {
     }
 
     this.socket.onopen = () => {
+      if (this.isManuallyDisabled) {
+        this.socket?.close();
+        return;
+      }
+
       this.isReconnecting = false;
       this.retryDelayMs = 2000;
       this.statusBadge.setReady("Daemon Ready");
 
+      // Send initial snapshot with last 10 messages immediately on connect
+      const initData = this.initialDataProvider?.();
       this.send({
         event: "tab_connected",
         tabId: this.tabId,
         title: document.title.replace(" - Google AI Studio", "").trim() || "Chat Tab",
+        turns: initData?.turns ?? [],
+        promptText: initData?.prompt.promptText ?? "",
+        buttonLabel: initData?.prompt.buttonLabel ?? "Run",
       });
 
       this.flushQueue();
@@ -75,8 +115,10 @@ export class BridgeWebSocket {
     };
 
     this.socket.onclose = () => {
-      this.statusBadge.setOffline("Daemon Offline");
-      this.scheduleReconnect();
+      if (!this.isManuallyDisabled) {
+        this.statusBadge.setOffline("Daemon Offline");
+        this.scheduleReconnect();
+      }
     };
 
     this.socket.onerror = () => {
@@ -85,7 +127,7 @@ export class BridgeWebSocket {
   }
 
   private scheduleReconnect(): void {
-    if (this.isReconnecting) return;
+    if (this.isReconnecting || this.isManuallyDisabled) return;
     this.isReconnecting = true;
     setTimeout(() => {
       this.isReconnecting = false;
@@ -103,6 +145,7 @@ export class BridgeWebSocket {
   }
 
   public sendTask(type: string, code: string, timeout: string): boolean {
+    if (this.isManuallyDisabled) return false;
     const task: QueuedTask = { type, code, timeout };
     if (this.socket && this.socket.readyState === WebSocket.OPEN) {
       this.dispatchTask(task);

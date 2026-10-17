@@ -13,39 +13,23 @@ export class StatusBadgeManager {
   private startTime = 0;
   private timerInterval: ReturnType<typeof setInterval> | null = null;
   private lastPromptStatus: PromptBoxStatus | undefined;
-
-  private readonly STYLES = {
-    ready: {
-      bg: "rgba(46, 125, 50, 0.15)",
-      fg: "#81c784",
-      border: "rgba(129, 199, 132, 0.3)",
-      icon: "🟢",
-    },
-    running: {
-      bg: "rgba(245, 124, 0, 0.15)",
-      fg: "#ffb74d",
-      border: "rgba(255, 183, 77, 0.3)",
-      icon: "🟡",
-    },
-    error: {
-      bg: "rgba(211, 47, 47, 0.15)",
-      fg: "#e57373",
-      border: "rgba(229, 115, 115, 0.3)",
-      icon: "🔴",
-    },
-    offline: {
-      bg: "rgba(120, 120, 120, 0.15)",
-      fg: "#aaa",
-      border: "rgba(120, 120, 120, 0.3)",
-      icon: "⚪",
-    },
-  };
+  private isUserDisabled = false;
+  private onToggleCallback: ((enabled: boolean) => void) | null = null;
 
   constructor() {
     this.render();
   }
 
+  public onToggle(cb: (enabled: boolean) => void): void {
+    this.onToggleCallback = cb;
+  }
+
+  public get isDisabled(): boolean {
+    return this.isUserDisabled;
+  }
+
   public setRunning(type: string, _timeout?: string): void {
+    if (this.isUserDisabled) return;
     this.state.status = "running";
     this.startTime = Date.now();
     this.state.label = `Executing ${type.toUpperCase()}...`;
@@ -60,6 +44,7 @@ export class StatusBadgeManager {
   }
 
   public setFinished(type: string, exitCode: number, output = ""): void {
+    if (this.isUserDisabled) return;
     if (this.timerInterval) clearInterval(this.timerInterval);
     const elapsed = `${((Date.now() - this.startTime) / 1000).toFixed(1)}s`;
     this.state.status = exitCode === 0 ? "ready" : "error";
@@ -72,12 +57,14 @@ export class StatusBadgeManager {
   }
 
   public setReady(msg = "Ready"): void {
+    if (this.isUserDisabled) return;
     this.state.status = "ready";
     this.state.label = msg;
     this.render();
   }
 
   public setOffline(msg = "Daemon Offline"): void {
+    if (this.isUserDisabled) return;
     if (this.timerInterval) clearInterval(this.timerInterval);
     this.state.status = "offline";
     this.state.label = msg;
@@ -94,31 +81,93 @@ export class StatusBadgeManager {
       badge = document.createElement("div");
       badge.id = "gemini-bridge-status";
       badge.style.cssText =
-        "display:inline-flex;align-items:center;gap:6px;padding:4px 10px;margin-right:8px;border-radius:12px;font-size:11px;font-family:monospace;font-weight:600;user-select:none;cursor:default;";
+        "display:inline-flex;align-items:center;gap:6px;padding:3px 8px;margin-right:8px;border-radius:12px;font-size:11px;font-family:monospace;font-weight:600;user-select:none;";
       headerRight.prepend(badge);
     }
 
-    const style = this.STYLES[this.state.status] || this.STYLES.offline;
+    const STYLES = {
+      ready: {
+        bg: "rgba(46, 125, 50, 0.15)",
+        fg: "#81c784",
+        border: "rgba(129, 199, 132, 0.3)",
+        icon: "🟢",
+      },
+      running: {
+        bg: "rgba(245, 124, 0, 0.15)",
+        fg: "#ffb74d",
+        border: "rgba(255, 183, 77, 0.3)",
+        icon: "🟡",
+      },
+      error: {
+        bg: "rgba(211, 47, 47, 0.15)",
+        fg: "#e57373",
+        border: "rgba(229, 115, 115, 0.3)",
+        icon: "🔴",
+      },
+      offline: {
+        bg: "rgba(120, 120, 120, 0.15)",
+        fg: "#aaa",
+        border: "rgba(120, 120, 120, 0.3)",
+        icon: "⚪",
+      },
+    };
+
+    const style = this.isUserDisabled
+      ? STYLES.offline
+      : STYLES[this.state.status] || STYLES.offline;
     badge.style.background = style.bg;
     badge.style.color = style.fg;
     badge.style.border = `1px solid ${style.border}`;
 
-    let text = `${style.icon} ${this.state.label}`;
-    if (this.state.lastCmd && this.state.status !== "running") {
+    let labelText = `${style.icon} ${this.isUserDisabled ? "Bridge Disabled" : this.state.label}`;
+    if (!this.isUserDisabled && this.state.lastCmd && this.state.status !== "running") {
       const exitIcon = this.state.lastExit === 0 ? "✓" : `✗(${this.state.lastExit})`;
-      text += ` [${exitIcon} ${this.state.lastCmd} ${this.state.lastElapsed}]`;
+      labelText += ` [${exitIcon} ${this.state.lastCmd} ${this.state.lastElapsed}]`;
     }
 
     const ps = this.lastPromptStatus;
-    if (ps) {
+    if (ps && !this.isUserDisabled) {
       const aiTag = ps.isAiPrinting ? " | ✍️ Printing" : " | ⏸ Idle";
       const btnState = ps.isButtonDisabled ? "dis" : "act";
       const btnTag = ` | ${ps.buttonLabel}(${btnState})`;
       const inputTag = ps.hasText ? ` | ${ps.charCount}c` : " | (empty)";
-      text += `${aiTag}${btnTag}${inputTag}`;
+      labelText += `${aiTag}${btnTag}${inputTag}`;
     }
 
-    badge.innerText = text;
+    // Text Span
+    let textSpan = badge.querySelector<HTMLSpanElement>("#gemini-bridge-text");
+    if (!textSpan) {
+      textSpan = document.createElement("span");
+      textSpan.id = "gemini-bridge-text";
+      badge.appendChild(textSpan);
+    }
+    textSpan.innerText = labelText;
+
+    // Disconnect / Connect Button
+    let btn = badge.querySelector<HTMLButtonElement>("#gemini-bridge-toggle-btn");
+    if (!btn) {
+      btn = document.createElement("button");
+      btn.id = "gemini-bridge-toggle-btn";
+      btn.style.cssText =
+        "margin-left:6px;padding:2px 6px;border-radius:6px;font-size:10px;font-family:inherit;font-weight:700;cursor:pointer;border:1px solid rgba(255,255,255,0.25);background:rgba(255,255,255,0.1);color:inherit;transition:all 0.2s;";
+      badge.appendChild(btn);
+
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this.isUserDisabled = !this.isUserDisabled;
+        if (this.isUserDisabled) {
+          if (this.timerInterval) clearInterval(this.timerInterval);
+        }
+        this.render();
+        this.onToggleCallback?.(!this.isUserDisabled);
+      });
+    }
+
+    btn.innerText = this.isUserDisabled ? "🔌 Connect" : "✕ Disconnect";
+    btn.title = this.isUserDisabled
+      ? "Re-enable bridge connection for this tab"
+      : "Disconnect tab from daemon as if closed";
+
     badge.title = this.state.lastOutput
       ? `Last Output (${this.state.lastCmd}):\n${this.state.lastOutput.slice(0, 400)}`
       : "Gemini Local Bridge";

@@ -17,6 +17,21 @@ import { BridgeWebSocket } from "./ws/client";
   let lastDigest = "";
   let lastVariantPromptTime = 0;
 
+  // Provide initial snapshot with last 10 turns upon connection
+  wsClient.setInitialDataProvider(() => ({
+    turns: extractAllChatTurns(false).slice(-10),
+    prompt: getPromptBoxStatus(),
+  }));
+
+  // Disconnect / Connect toggle listener from badge button
+  statusBadge.onToggle((enabled) => {
+    if (enabled) {
+      wsClient.enable();
+    } else {
+      wsClient.disable();
+    }
+  });
+
   // Server commands variant selection
   wsClient.onSelectVariant((idx) => {
     console.log(`[Bridge] Server requested variant selection: #${idx}`);
@@ -24,6 +39,8 @@ import { BridgeWebSocket } from "./ws/client";
   });
 
   const syncState = (): void => {
+    if (statusBadge.isDisabled) return;
+
     const promptStatus = getPromptBoxStatus();
     const turns = Array.from(document.querySelectorAll<HTMLElement>("ms-chat-turn"));
     const latestTurn = turns[turns.length - 1] ?? null;
