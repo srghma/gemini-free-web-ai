@@ -1,0 +1,212 @@
+import asyncio
+import itertools
+import json
+import random
+import time
+import uuid
+from typing import Any, Dict, List, Optional
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+import uvicorn
+
+app = FastAPI(title="Gemini Daemon", version="1.1.0")
+
+MODELS = [
+    {
+        "name": "gemini-2.5-pro",
+        "model": "gemini-2.5-pro",
+        "details": {"family": "gemini", "parameter_size": "experimental", "quantization_level": "none"},
+        "capabilities": ["thinking", "multiturn", "code_execution"],
+    },
+    {
+        "name": "gemini-2.5-flash",
+        "model": "gemini-2.5-flash",
+        "details": {"family": "gemini", "parameter_size": "standard", "quantization_level": "none"},
+        "capabilities": ["thinking", "multiturn"],
+    },
+    {
+        "name": "gemini-2.5-flash-thinking",
+        "model": "gemini-2.5-flash-thinking",
+        "details": {"family": "gemini", "parameter_size": "reasoning", "quantization_level": "none"},
+        "capabilities": ["deep_thinking", "multiturn"],
+    },
+    {
+        "name": "gemini-2.0-flash-lite",
+        "model": "gemini-2.0-flash-lite",
+        "details": {"family": "gemini", "parameter_size": "distilled", "quantization_level": "none"},
+        "capabilities": ["low_latency"],
+    },
+]
+
+LOREM_PARAGRAPHS = [
+    "Lorem ipsum dolor sit amet, **consectetur adipiscing elit**. Mauris convallis orci a velit gravida, nec dapibus tellus posuere.",
+    "Ut enim ad minim veniam, *quis nostrud exercitation* ullamco laboris nisi ut aliquip ex ea commodo consequat.",
+    "```python\n# Concurrent pipeline execution\nasync def stream_tokens(queue: asyncio.Queue):\n    while not queue.empty():\n        yield await queue.get()\n```",
+    "Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur.",
+    "- Scalable shared daemon memory\n- Multi-client websocket / HTTP sync\n- Native Vim modal navigation",
+    "Praesent vulputate quam a elit dignissim, vel malesuada risus pellentesque. Vivamus sodales finibus pulvinar.",
+]
+
+THOUGHT_STEPS = [
+    "Deconstructing multi-turn context and verifying model hyperparameters...",
+    "Retrieving internal representations and checking grounding assertions...",
+    "Structuring output: generating code blocks, itemized lists, and prose...",
+    "Formatting final markdown response stream according to Gemini studio guidelines...",
+]
+
+# Shared In-Memory Chat Store (Thread-safe via asyncio event loop)
+class MessageModel(BaseModel):
+    role: str
+    content: str
+    thought: str = ""
+
+class ChatSessionModel(BaseModel):
+    id: str
+    title: str
+    model: str
+    system: str = "You are a helpful Gemini assistant."
+    messages: List[MessageModel] = Field(default_factory=list)
+    created_at: float = Field(default_factory=time.time)
+    updated_at: float = Field(default_factory=time.time)
+    is_generating: bool = False
+
+CHAT_SESSIONS: Dict[str, ChatSessionModel] = {}
+
+def init_default_chats():
+    default_id = "chat-welcome"
+    CHAT_SESSIONS[default_id] = ChatSessionModel(
+        id=default_id,
+        title="Welcome & Quickstart",
+        model="gemini-2.5-pro",
+        messages=[
+            MessageModel(
+                role="assistant",
+                content="Welcome to **Gemini AI Studio** TUI! Select an existing chat or press `n` to create a new session.",
+                thought="System initialized successfully.",
+            )
+        ],
+    )
+
+init_default_chats()
+
+# Helpers
+make_chunk = lambda model, chat_id, content="", done=False: json.dumps({
+    "model": model,
+    "chat_id": chat_id,
+    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S.000000Z", time.gmtime()),
+    "message": {"role": "assistant", "content": content},
+    "done": done,
+}) + "\n"
+
+# Endpoints
+@app.get("/api/version")
+async def get_version():
+    return {"version": "0.1.34-mock"}
+
+@app.get("/api/tags")
+async def list_models():
+    return {"models": MODELS}
+
+@app.get("/api/chats")
+async def get_all_chats():
+    return [
+        {
+            "id": c.id,
+            "title": c.title,
+            "model": c.model,
+            "message_count": len(c.messages),
+            "updated_at": c.updated_at,
+            "is_generating": c.is_generating,
+        }
+        for c in sorted(CHAT_SESSIONS.values(), key=lambda x: x.updated_at, reverse=True)
+    ]
+
+@app.post("/api/chats")
+async def create_chat(payload: Dict[str, Any]):
+    new_id = f"chat-{uuid.uuid4().hex[:8]}"
+    model = payload.get("model", "gemini-2.5-pro")
+    title = payload.get("title", f"New Chat ({model})")
+    system = payload.get("system", "You are a helpful Gemini assistant.")
+
+    session = ChatSessionModel(id=new_id, title=title, model=model, system=system)
+    CHAT_SESSIONS[new_id] = session
+    return session
+
+@app.get("/api/chats/{chat_id}")
+async def get_chat_detail(chat_id: str):
+    if chat_id not in CHAT_SESSIONS:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    return CHAT_SESSIONS[chat_id]
+
+async def stream_chat_response(session: ChatSessionModel, prompt: str):
+    session.is_generating = True
+    session.updated_at = time.time()
+    accumulated_thought = ""
+    accumulated_answer = ""
+
+    try:
+        # Phase 1: Thinking Process
+        yield make_chunk(session.model, session.id, "<thought>\n")
+        for step in THOUGHT_STEPS:
+            thought_line = f"• {step}\n"
+            accumulated_thought += thought_line
+            yield make_chunk(session.model, session.id, thought_line)
+            await asyncio.sleep(random.uniform(0.08, 0.16))
+        yield make_chunk(session.model, session.id, "</thought>\n\n")
+
+        # Phase 2: Generating response tokens
+        selected_paragraphs = random.sample(LOREM_PARAGRAPHS, k=random.randint(2, 4))
+        full_text = "\n\n".join(selected_paragraphs)
+        words = full_text.split(" ")
+
+        for word in words:
+            token = word + " "
+            accumulated_answer += token
+            yield make_chunk(session.model, session.id, token)
+            await asyncio.sleep(random.uniform(0.015, 0.035))
+
+        # Commit final assistant message to daemon storage
+        session.messages.append(
+            MessageModel(role="assistant", content=accumulated_answer.strip(), thought=accumulated_thought.strip())
+        )
+        session.updated_at = time.time()
+        yield make_chunk(session.model, session.id, "", done=True)
+    finally:
+        session.is_generating = False
+
+@app.post("/api/chat")
+async def chat_endpoint(request: Request):
+    data = await request.json()
+    model = data.get("model", "gemini-2.5-pro")
+    chat_id = data.get("chat_id")
+    messages = data.get("messages", [])
+
+    if not messages:
+        raise HTTPException(status_code=400, detail="Messages array cannot be empty")
+
+    user_last_content = messages[-1].get("content", "")
+
+    # Auto-resolve or create chat session
+    if not chat_id or chat_id not in CHAT_SESSIONS:
+        chat_id = f"chat-{uuid.uuid4().hex[:8]}"
+        title_snippet = (user_last_content[:26] + "...") if len(user_last_content) > 26 else user_last_content
+        CHAT_SESSIONS[chat_id] = ChatSessionModel(
+            id=chat_id,
+            title=title_snippet or f"Chat ({model})",
+            model=model,
+        )
+
+    session = CHAT_SESSIONS[chat_id]
+    session.messages.append(MessageModel(role="user", content=user_last_content))
+
+    return StreamingResponse(
+        stream_chat_response(session, user_last_content),
+        media_type="application/x-ndjson",
+    )
+
+def main():
+    uvicorn.run(app, host="127.0.0.1", port=11434, log_level="info")
+
+if __name__ == "__main__":
+    main()

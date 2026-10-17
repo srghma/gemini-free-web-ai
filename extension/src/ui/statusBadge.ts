@@ -12,6 +12,7 @@ export class StatusBadgeManager {
 
   private startTime = 0;
   private timerInterval: ReturnType<typeof setInterval> | null = null;
+  private lastPromptStatus: PromptBoxStatus | undefined;
 
   private readonly STYLES = {
     ready: {
@@ -40,6 +41,10 @@ export class StatusBadgeManager {
     },
   };
 
+  constructor() {
+    this.render();
+  }
+
   public setRunning(type: string, _timeout?: string): void {
     this.state.status = "running";
     this.startTime = Date.now();
@@ -49,7 +54,9 @@ export class StatusBadgeManager {
     this.timerInterval = setInterval(() => {
       const sec = Math.round((Date.now() - this.startTime) / 1000);
       this.state.label = `Executing ${type.toUpperCase()} (${sec}s)...`;
+      this.render();
     }, 1000);
+    this.render();
   }
 
   public setFinished(type: string, exitCode: number, output = ""): void {
@@ -61,20 +68,24 @@ export class StatusBadgeManager {
     this.state.lastExit = exitCode;
     this.state.lastElapsed = elapsed;
     this.state.lastOutput = output;
+    this.render();
   }
 
   public setReady(msg = "Ready"): void {
     this.state.status = "ready";
     this.state.label = msg;
+    this.render();
   }
 
   public setOffline(msg = "Daemon Offline"): void {
     if (this.timerInterval) clearInterval(this.timerInterval);
     this.state.status = "offline";
     this.state.label = msg;
+    this.render();
   }
 
   public render(promptStatus?: PromptBoxStatus): void {
+    if (promptStatus) this.lastPromptStatus = promptStatus;
     const headerRight = document.querySelector("ms-header .toolbar-right");
     if (!headerRight) return;
 
@@ -98,11 +109,12 @@ export class StatusBadgeManager {
       text += ` [${exitIcon} ${this.state.lastCmd} ${this.state.lastElapsed}]`;
     }
 
-    if (promptStatus) {
-      const aiTag = promptStatus.isAiPrinting ? " | ✍️ Printing" : " | ⏸ Idle";
-      const btnState = promptStatus.isButtonDisabled ? "dis" : "act";
-      const btnTag = ` | ${promptStatus.buttonLabel}(${btnState})`;
-      const inputTag = promptStatus.hasText ? ` | ${promptStatus.charCount}c` : " | (empty)";
+    const ps = this.lastPromptStatus;
+    if (ps) {
+      const aiTag = ps.isAiPrinting ? " | ✍️ Printing" : " | ⏸ Idle";
+      const btnState = ps.isButtonDisabled ? "dis" : "act";
+      const btnTag = ` | ${ps.buttonLabel}(${btnState})`;
+      const inputTag = ps.hasText ? ` | ${ps.charCount}c` : " | (empty)";
       text += `${aiTag}${btnTag}${inputTag}`;
     }
 

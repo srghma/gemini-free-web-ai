@@ -1,37 +1,47 @@
 import type { PromptBoxStatus } from "../types";
-import { setAngularValue, sleep, waitForEl } from "./angular";
+import { setAngularValue, sleep, waitFor, waitForEl } from "./angular";
+
+export const getPromptTextarea = (): HTMLTextAreaElement | null =>
+  document.querySelector<HTMLTextAreaElement>(
+    'ms-prompt-box textarea[formcontrolname="promptText"], ms-prompt-box textarea.textarea, textarea[aria-label*="prompt" i]'
+  );
+
+export const getSubmitButton = (): HTMLButtonElement | null => {
+  const promptBox = document.querySelector("ms-prompt-box");
+  if (promptBox) {
+    const ctrlEnterBtn = promptBox.querySelector<HTMLButtonElement>(
+      "button.ctrl-enter-submits:not(.rerun-button)"
+    );
+    if (ctrlEnterBtn) return ctrlEnterBtn;
+
+    const primaryBtn = promptBox.querySelector<HTMLButtonElement>(
+      "button.ms-button-primary:not(.rerun-button)"
+    );
+    if (primaryBtn) return primaryBtn;
+  }
+  return document.querySelector<HTMLButtonElement>("button.ctrl-enter-submits:not(.rerun-button)");
+};
 
 export const getPromptBoxStatus = (): PromptBoxStatus => {
-  const textarea = document.querySelector<HTMLTextAreaElement>(
-    'ms-prompt-box textarea[formcontrolname="promptText"], ms-prompt-box textarea.textarea'
-  );
-  const runBtn = document.querySelector<HTMLButtonElement>(
-    "ms-prompt-box ms-run-button button, ms-prompt-box button.run-button"
-  );
-  const labelEl = runBtn?.querySelector<HTMLElement>(".run-button-label");
-  const iconEl = runBtn?.querySelector<HTMLElement>(".material-symbols-outlined");
+  const textarea = getPromptTextarea();
+  const runBtn = getSubmitButton();
 
-  const rawLabel = (labelEl?.textContent || "").trim();
-  const rawIcon = (iconEl?.textContent || "").trim().toLowerCase();
+  const labelEl = runBtn?.querySelector<HTMLElement>(".run-button-label");
+  const rawLabel = (labelEl?.textContent || runBtn?.textContent || "").trim();
   const ariaLabel = (runBtn?.getAttribute("aria-label") || "").toLowerCase();
 
-  const hasStopText =
-    rawLabel.toLowerCase().includes("stop") || ariaLabel.includes("stop") || rawIcon === "stop";
+  const hasStop = rawLabel.toLowerCase().includes("stop") || ariaLabel.includes("stop");
   const hasSpinner = !!document.querySelector(
     "mat-progress-spinner, mat-spinner, .mat-mdc-progress-spinner, ms-run-button .spinner"
   );
-  const hasCancelBtn = !!document.querySelector(
-    'button[aria-label*="Stop" i], button[aria-label*="Cancel" i]'
-  );
-
-  const isAiPrinting = hasStopText || hasSpinner || hasCancelBtn;
+  const isAiPrinting = hasStop || hasSpinner;
   const charCount = textarea?.value?.length ?? 0;
   const isButtonDisabled = runBtn?.getAttribute("aria-disabled") === "true" || !!runBtn?.disabled;
 
   return {
     hasText: charCount > 0,
     charCount,
-    buttonLabel: isAiPrinting ? "Stop" : rawLabel || "Run",
+    buttonLabel: isAiPrinting ? "Stop" : rawLabel.split("\n")[0] || "Run",
     isButtonDisabled,
     isAiPrinting,
   };
@@ -39,34 +49,43 @@ export const getPromptBoxStatus = (): PromptBoxStatus => {
 
 export const submitPrompt = async (text: string): Promise<boolean> => {
   const promptInput = await waitForEl<HTMLTextAreaElement>(
-    'ms-prompt-box textarea[formcontrolname="promptText"], textarea[aria-label*="prompt" i], textarea.textarea'
+    'ms-prompt-box textarea[formcontrolname="promptText"], ms-prompt-box textarea.textarea, textarea[aria-label*="prompt" i]',
+    4000
   );
-  if (!promptInput) {
-    console.error("[Bridge] Prompt textarea not found");
-    return false;
-  }
+  if (!promptInput) return false;
 
   setAngularValue(promptInput, text);
-  await sleep(350);
 
-  const runBtn = document.querySelector<HTMLButtonElement>(
-    'ms-run-button button, button.run-button, button[aria-label*="Run" i]'
-  );
+  // Wait up to 350ms for Angular to enable the submit button
+  const runBtn =
+    (await waitFor(
+      () => {
+        const btn = getSubmitButton();
+        if (btn && btn.getAttribute("aria-disabled") !== "true" && !btn.disabled) return btn;
+        return null;
+      },
+      400,
+      40
+    )) || getSubmitButton();
 
   const isDisabled = runBtn?.getAttribute("aria-disabled") === "true" || !!runBtn?.disabled;
 
   if (runBtn && !isDisabled) {
     runBtn.click();
-    return true;
+    await sleep(150);
+    if (!promptInput.value || promptInput.value !== text) return true;
   }
 
-  // Fallback to Ctrl+Enter
+  // Hotkey dispatch fallback
   promptInput.dispatchEvent(
     new KeyboardEvent("keydown", {
       key: "Enter",
       code: "Enter",
+      keyCode: 13,
+      which: 13,
       ctrlKey: true,
       bubbles: true,
+      cancelable: true,
     })
   );
   return true;

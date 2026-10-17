@@ -4,21 +4,46 @@ import { formatExecutionReply } from "../execution/formatter";
 import type { DaemonExecutionResponse } from "../types";
 import type { StatusBadgeManager } from "../ui/statusBadge";
 
+interface QueuedTask {
+  type: string;
+  code: string;
+  timeout: string;
+}
+
 export class BridgeWebSocket {
   private socket: WebSocket | null = null;
   private isReconnecting = false;
+  private retryDelayMs = 2000;
+  private pendingQueue: QueuedTask[] = [];
 
-  constructor(private statusBadge: StatusBadgeManager) {
+  constructor(
+    private statusBadge: StatusBadgeManager,
+    private tabId: string
+  ) {
     this.connect();
   }
 
   private connect(): void {
-    this.socket = new WebSocket(CONFIG.wsUrl);
+    try {
+      this.socket = new WebSocket(CONFIG.wsUrl);
+    } catch {
+      this.statusBadge.setOffline("Daemon Offline");
+      this.scheduleReconnect();
+      return;
+    }
 
     this.socket.onopen = () => {
-      console.log("[Bridge] Connected to daemon.");
       this.isReconnecting = false;
+      this.retryDelayMs = 2000;
       this.statusBadge.setReady("Daemon Ready");
+
+      this.send({
+        event: "tab_connected",
+        tabId: this.tabId,
+        title: document.title.replace(" - Google AI Studio", "").trim() || "Chat Tab",
+      });
+
+      this.flushQueue();
     };
 
     this.socket.onmessage = async (event: MessageEvent) => {
@@ -38,7 +63,7 @@ export class BridgeWebSocket {
 
     this.socket.onclose = () => {
       this.statusBadge.setOffline("Daemon Offline");
-      this.reconnect();
+      this.scheduleReconnect();
     };
 
     this.socket.onerror = () => {
@@ -46,24 +71,49 @@ export class BridgeWebSocket {
     };
   }
 
-  private reconnect(): void {
+  private scheduleReconnect(): void {
     if (this.isReconnecting) return;
     this.isReconnecting = true;
-    setTimeout(() => this.connect(), 2000);
+    setTimeout(() => {
+      this.isReconnecting = false;
+      this.connect();
+    }, this.retryDelayMs);
+    this.retryDelayMs = Math.min(this.retryDelayMs * 2, 15000);
   }
 
-  public sendTask(type: string, code: string, timeout: string): boolean {
+  public send(payload: Record<string, unknown>): boolean {
     if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-      this.socket.send(
-        JSON.stringify({
-          command: `execute-${type}-and-send-output-to`,
-          type,
-          timeout,
-          code,
-        })
-      );
+      this.socket.send(JSON.stringify(payload));
       return true;
     }
     return false;
+  }
+
+  public sendTask(type: string, code: string, timeout: string): boolean {
+    const task: QueuedTask = { type, code, timeout };
+    if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+      this.dispatchTask(task);
+      return true;
+    }
+    this.pendingQueue.push(task);
+    return false;
+  }
+
+  private dispatchTask(task: QueuedTask): void {
+    this.send({
+      command: `execute-${task.type}-and-send-output-to`,
+      tabId: this.tabId,
+      type: task.type,
+      timeout: task.timeout,
+      code: task.code,
+    });
+  }
+
+  private flushQueue(): void {
+    while (this.pendingQueue.length > 0) {
+      const task = this.pendingQueue.shift();
+      if (!task) break;
+      this.dispatchTask(task);
+    }
   }
 }

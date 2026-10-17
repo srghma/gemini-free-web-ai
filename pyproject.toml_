@@ -1,0 +1,18 @@
+[project]
+name = "gemini-free-web-ai"
+version = "0.1.0"
+description = "Mock Gemini AI Studio server daemon and multi-client TUI with Vim navigation"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "httpx>=0.28.0",
+    "textual>=1.0.0",
+    "rich>=13.7.0",
+    "pydantic>=2.0.0",
+]
+
+[project.scripts]
+daemon = "daemon:main"
+tui = "tui:main"

@@ -5,7 +5,7 @@ export const sleep = (ms: number): Promise<void> =>
 export const waitFor = async <T>(
   predicate: () => T | null | undefined,
   timeout = 7000,
-  step = 150
+  step = 40
 ): Promise<T | null> => {
   const start = Date.now();
   while (Date.now() - start < timeout) {

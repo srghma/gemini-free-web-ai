@@ -1,4 +1,5 @@
 import { CONFIG } from "./config";
+import { extractAllChatTurns } from "./dom/chatExtractor";
 import { ensurePresetSelected } from "./dom/preset";
 import { getPromptBoxStatus } from "./dom/promptBox";
 import { TurnSettler, extractBridgeCommand } from "./execution/parser";
@@ -6,56 +7,76 @@ import { StatusBadgeManager } from "./ui/statusBadge";
 import { BridgeWebSocket } from "./ws/client";
 
 (() => {
+  const tabId = `tab_${Math.random().toString(36).substring(2, 7)}`;
   const statusBadge = new StatusBadgeManager();
-  const wsClient = new BridgeWebSocket(statusBadge);
+  const wsClient = new BridgeWebSocket(statusBadge, tabId);
   const turnSettler = new TurnSettler();
 
-  let lastHandledKey = "";
-
-  const getLatestModelTurn = (turns: HTMLElement[]): HTMLElement | null => {
-    for (let i = turns.length - 1; i >= 0; i--) {
-      const turn = turns[i];
-      if (!turn) continue;
-      const isUser = turn.querySelector('.chat-turn-container.user, [data-turn-role="User"]');
-      if (!isUser) return turn;
-    }
-    return turns[turns.length - 1] ?? null;
-  };
+  const handledTurnIds = new Set<string>();
+  let lastDigest = "";
 
   const startTurnScanner = (): void => {
     setInterval(() => {
+      const promptStatus = getPromptBoxStatus();
       const turns = Array.from(document.querySelectorAll<HTMLElement>("ms-chat-turn"));
-      const targetTurn = getLatestModelTurn(turns);
+      const latestTurn = turns[turns.length - 1] ?? null;
 
-      const { isPrinting, isSettled } = turnSettler.check(targetTurn);
+      const { isPrinting: settlerPrinting, isSettled } = turnSettler.check(latestTurn);
+      const isGlobalPrinting = promptStatus.isAiPrinting || settlerPrinting;
 
-      const promptBoxStatus = getPromptBoxStatus();
-      promptBoxStatus.isAiPrinting = isPrinting;
-      statusBadge.render(promptBoxStatus);
+      const extractedTurns = extractAllChatTurns(isGlobalPrinting);
 
-      if (isPrinting || !isSettled || !targetTurn) {
+      const currentDigest = JSON.stringify({
+        isGlobalPrinting,
+        btn: promptStatus.buttonLabel,
+        turns: extractedTurns.map((t) => [
+          t.id,
+          t.status,
+          t.chatContent?.length,
+          t.thinkingContent?.length,
+        ]),
+      });
+
+      if (currentDigest !== lastDigest) {
+        lastDigest = currentDigest;
+        wsClient.send({
+          event: "tab_chat_update",
+          tabId,
+          isPrinting: isGlobalPrinting,
+          buttonLabel: promptStatus.buttonLabel,
+          turns: extractedTurns,
+        });
+      }
+
+      statusBadge.render(promptStatus);
+
+      if (!latestTurn || isGlobalPrinting || !isSettled) return;
+
+      const isModelTurn = !latestTurn.querySelector(
+        '.chat-turn-container.user, [data-turn-role="User"]'
+      );
+      if (!isModelTurn) return;
+
+      const turnId = latestTurn.id || latestTurn.getAttribute("id") || "";
+      if (turnId && handledTurnIds.has(turnId)) return;
+
+      const parsed = extractBridgeCommand(latestTurn);
+      if (!parsed) {
+        if (turnId) handledTurnIds.add(turnId);
         return;
       }
 
-      const parsed = extractBridgeCommand(targetTurn);
-      if (!parsed) return;
-
-      const currentKey = `${parsed.type}:${parsed.code}`;
-      if (currentKey === lastHandledKey) return;
-      lastHandledKey = currentKey;
-
-      console.log(`[Bridge] Turn settled. Dispatched ${parsed.rawType}:`, parsed);
+      if (turnId) handledTurnIds.add(turnId);
+      console.log(`[Bridge] Dispatched execution for turn ${turnId}:`, parsed);
       statusBadge.setRunning(parsed.type);
       wsClient.sendTask(parsed.type, parsed.code, parsed.timeout);
     }, CONFIG.pollIntervalMs);
   };
 
-  (async () => {
-    try {
-      await ensurePresetSelected();
-    } catch (err) {
-      console.warn("[Bridge] Preset sync deferred:", err);
-    }
-    startTurnScanner();
-  })();
+  statusBadge.render();
+  startTurnScanner();
+
+  ensurePresetSelected().catch((err) => {
+    console.warn("[Bridge] Preset sync deferred:", err);
+  });
 })();

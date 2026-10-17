@@ -10,7 +10,7 @@
         "https://aistudio.google.com/live/*"
       ],
       "js": ["src/content.ts"],
-      "run_at": "document_idle"
+      "run_at": "document_end"
     }
   ]
 }
