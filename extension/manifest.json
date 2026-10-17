@@ -5,7 +5,7 @@
   "description": "Bridge Google AI Studio directly to local execution daemon",
   "content_scripts": [
     {
-      "matches": ["https://aistudio.google.com/prompts/*"],
+      "matches": ["https://aistudio.google.com/prompts/*", "https://aistudio.google.com/live/*"],
       "js": ["content.js"],
       "run_at": "document_idle"
     }
