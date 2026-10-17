@@ -3,7 +3,7 @@ import { extractAllChatTurns } from "./dom/chatExtractor";
 import { ensurePresetSelected } from "./dom/preset";
 import { getPromptBoxStatus } from "./dom/promptBox";
 import { clickVariantChoice, detectProposedVariants } from "./dom/variantDetector";
-import { TurnSettler, extractBridgeCommand } from "./execution/parser";
+import { TurnSettler, extractBridgeCommands } from "./execution/parser";
 import { StatusBadgeManager } from "./ui/statusBadge";
 import { BridgeWebSocket } from "./ws/client";
 
@@ -17,13 +17,11 @@ import { BridgeWebSocket } from "./ws/client";
   let lastDigest = "";
   let lastVariantPromptTime = 0;
 
-  // Provide initial snapshot with last 10 turns upon connection
   wsClient.setInitialDataProvider(() => ({
     turns: extractAllChatTurns(false).slice(-10),
     prompt: getPromptBoxStatus(),
   }));
 
-  // Disconnect / Connect toggle listener from badge button
   statusBadge.onToggle((enabled) => {
     if (enabled) {
       wsClient.enable();
@@ -32,7 +30,6 @@ import { BridgeWebSocket } from "./ws/client";
     }
   });
 
-  // Server commands variant selection
   wsClient.onSelectVariant((idx) => {
     console.log(`[Bridge] Server requested variant selection: #${idx}`);
     clickVariantChoice(idx);
@@ -50,7 +47,6 @@ import { BridgeWebSocket } from "./ws/client";
 
     const extractedTurns = extractAllChatTurns(isGlobalPrinting);
 
-    // Detect if two variants are proposed (preference voting)
     const variantResult = detectProposedVariants();
     if (variantResult.hasVariants && Date.now() - lastVariantPromptTime > 4000) {
       lastVariantPromptTime = Date.now();
@@ -97,19 +93,20 @@ import { BridgeWebSocket } from "./ws/client";
     const turnId = latestTurn.id || latestTurn.getAttribute("id") || "";
     if (turnId && handledTurnIds.has(turnId)) return;
 
-    const parsed = extractBridgeCommand(latestTurn);
-    if (!parsed) {
+    const parsedCommands = extractBridgeCommands(latestTurn);
+    if (parsedCommands.length === 0) {
       if (turnId) handledTurnIds.add(turnId);
       return;
     }
 
     if (turnId) handledTurnIds.add(turnId);
-    console.log(`[Bridge] Dispatched execution for turn ${turnId}:`, parsed);
-    statusBadge.setRunning(parsed.type);
-    wsClient.sendTask(parsed.type, parsed.code, parsed.timeout);
+    console.log(`[Bridge] Dispatched ${parsedCommands.length} command(s) for turn ${turnId}`);
+    const parsedCommand = parsedCommands[0];
+    if (!parsedCommand) throw new Error("parsedCommand empty");
+    statusBadge.setRunning(parsedCommand.type);
+    wsClient.sendTaskBatch(parsedCommands);
   };
 
-  // Immediate streaming on typing
   document.addEventListener(
     "input",
     (e) => {

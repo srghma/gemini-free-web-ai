@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
@@ -134,7 +134,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     session.button_label = data.get("buttonLabel", "Run")
                     session.last_seen = datetime.now()
 
-                    # Instantly populate with initial turns sent by tab
                     raw_turns = data.get("turns", [])
                     if raw_turns:
                         session.turns = [
@@ -218,7 +217,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     except Exception:
         pass
     finally:
-        if current_tab_id:
+        if current_tab_id and current_tab_id in state.tabs:
             state.tabs.pop(current_tab_id, None)
             tab_tag = escape(f"[{current_tab_id}]")
             state.add_log(f"⚪ [dim]Chrome tab closed: {tab_tag}[/dim]")

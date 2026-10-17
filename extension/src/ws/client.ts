@@ -5,7 +5,7 @@ import { formatExecutionReply } from "../execution/formatter";
 import type { DaemonExecutionResponse, PromptBoxStatus } from "../types";
 import type { StatusBadgeManager } from "../ui/statusBadge";
 
-interface QueuedTask {
+export interface QueuedTask {
   type: string;
   code: string;
   timeout: string;
@@ -24,6 +24,12 @@ export class BridgeWebSocket {
   private onSelectVariantHandler: ((variantIndex: number) => void) | null = null;
   private initialDataProvider: (() => InitialDataPayload) | null = null;
   private isManuallyDisabled = false;
+
+  // Batch execution state
+  private batchQueue: QueuedTask[][] = [];
+  private activeBatch: QueuedTask[] = [];
+  private activeBatchOutputs: string[] = [];
+  private isBatchExecuting = false;
 
   constructor(
     private statusBadge: StatusBadgeManager,
@@ -77,7 +83,6 @@ export class BridgeWebSocket {
       this.retryDelayMs = 2000;
       this.statusBadge.setReady("Daemon Ready");
 
-      // Send initial snapshot with last 10 messages immediately on connect
       const initData = this.initialDataProvider?.();
       this.send({
         event: "tab_connected",
@@ -108,7 +113,13 @@ export class BridgeWebSocket {
         }
 
         this.statusBadge.setFinished(execResp.type, execResp.exitCode ?? 0, execResp.output || "");
-        await submitPrompt(formatExecutionReply(execResp));
+
+        if (this.isBatchExecuting) {
+          this.activeBatchOutputs.push(formatExecutionReply(execResp));
+          this.advanceBatchExecution();
+        } else {
+          await submitPrompt(formatExecutionReply(execResp));
+        }
       } catch (err) {
         console.error("[Bridge] Failed parsing daemon message:", err);
       }
@@ -144,25 +155,56 @@ export class BridgeWebSocket {
     return false;
   }
 
+  public sendTaskBatch(tasks: QueuedTask[]): boolean {
+    if (this.isManuallyDisabled || tasks.length === 0) return false;
+    this.batchQueue.push(tasks);
+    this.processNextBatch();
+    return true;
+  }
+
   public sendTask(type: string, code: string, timeout: string): boolean {
-    if (this.isManuallyDisabled) return false;
-    const task: QueuedTask = { type, code, timeout };
-    if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-      this.dispatchTask(task);
-      return true;
+    return this.sendTaskBatch([{ type, code, timeout }]);
+  }
+
+  private processNextBatch(): void {
+    if (this.isBatchExecuting || this.batchQueue.length === 0) return;
+    const nextBatch = this.batchQueue.shift();
+    if (!nextBatch) return;
+    this.activeBatch = nextBatch;
+    this.activeBatchOutputs = [];
+    this.isBatchExecuting = true;
+    this.advanceBatchExecution();
+  }
+
+  private advanceBatchExecution(): void {
+    if (this.activeBatch.length > 0) {
+      const nextTask = this.activeBatch.shift();
+      if (!nextTask) throw new Error("nextTask empty");
+      this.dispatchTask(nextTask);
+    } else {
+      const finalReply = this.activeBatchOutputs.join("\n\n");
+      this.isBatchExecuting = false;
+      if (finalReply) {
+        submitPrompt(finalReply).catch((err) => {
+          console.error("[Bridge] Failed submitting execution reply:", err);
+        });
+      }
+      this.processNextBatch();
     }
-    this.pendingQueue.push(task);
-    return false;
   }
 
   private dispatchTask(task: QueuedTask): void {
-    this.send({
-      command: `execute-${task.type}-and-send-output-to`,
-      tabId: this.tabId,
-      type: task.type,
-      timeout: task.timeout,
-      code: task.code,
-    });
+    if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+      this.send({
+        command: `execute-${task.type}-and-send-output-to`,
+        tabId: this.tabId,
+        type: task.type,
+        timeout: task.timeout,
+        code: task.code,
+      });
+    } else {
+      this.pendingQueue.push(task);
+    }
   }
 
   private flushQueue(): void {

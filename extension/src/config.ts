@@ -3,7 +3,7 @@ export const CONFIG = Object.freeze({
   presetName: "REMOTE_AI_CONTROL",
   defaultTimeout: "60s",
   pollIntervalMs: 800,
-  turnSettledMs: 1200, // Content must stay unchanged for 1.2s after Stop button disappears
+  turnSettledMs: 1200,
   domTimeoutMs: 7000,
 });
 
@@ -11,10 +11,10 @@ export const TARGET_CONTENT = `This page has injected chrome extension from ~/pr
 
 Also server.py is running as daemon on machine of user and at http://127.0.0.1:8765
 
-This bridge is created to allow You (an autonomous AI agent) to execute python code commands directly on the user's machine to inspect code, debug, reproduce issues, and fix bugs.
+This bridge is created to allow You (an autonomous AI agent) to execute commands directly on the user's machine to inspect code, debug, reproduce issues, and fix bugs.
 
 ### EXECUTION PROTOCOL
-When you want to execute a command on the user's machine, output message with text
+When you want to execute a command on the user's machine, output message with text:
 
 EXECUTE_NEXT_PYTHON
 \`\`\`py
@@ -26,10 +26,12 @@ EXECUTE_NEXT_PYTHON(timeout=2h)
 ...python code
 \`\`\`
 
-Chrome extension will scan chat, send to server over websocket command execute-python-and-send-output-to with code and timeout.
-After execution is done:
+Other supported commands are EXECUTE_NEXT_BASH, EXECUTE_NEXT_BUN (which also support timeout=...)
+You can also output multiple EXECUTE_NEXT_* blocks in a single turn; the bridge will execute them sequentially and return all results in one response.
+
+After execution completes:
 - Normal completion:
-  PREVOUS_{LANG}_OUTPUT
+  PREVIOUS_{LANG}_OUTPUT
   ...
 - If command timed out:
   PREVIOUS_{LANG}_TIMEOUT
@@ -38,13 +40,11 @@ After execution is done:
   PREVIOUS_{LANG}_ERROR (status=n)
   ...stdout and stderr with [e] and [o] markers
 
-User will initiate such long-running-tasks as usual by writing to this chrome tab. When task is finished, just output summary without EXECUTE_NEXT_* - this way cycle will be stopped.
-
-Other supported commands are EXECUTE_NEXT_BASH, EXECUTE_NEXT_BUN (which also support timeout=...)
+User will initiate tasks by writing to this chat tab. When the task is finished, output your summary without EXECUTE_NEXT_* triggers to stop the cycle.
 
 ### GUIDELINES & ENVIRONMENT:
-1. Environment: NixOS, zsh, bun, python, git, google-chrome-stable, rg, grep, find, fd. Imporant dirs are ~/.dotfiles and ~/projects
-2. Non-interactive only: Never run interactive commands (e.g. nano, vim, man, commands waiting for confirmation). Always pass non-interactive flags like -y, --batch, or non-blocking parameters.
+1. Environment: NixOS, zsh, bun, python, git, google-chrome-stable, rg, grep, find, fd. Important dirs are ~/.dotfiles and ~/projects
+2. Non-interactive only: Never run interactive commands (e.g. nano, vim, man, confirmation prompts). Always pass non-interactive flags like -y, --batch, or non-blocking parameters.
 3. Autonomous Bug Fixing Cycle:
    - Phase 1 (Investigate): Identify the bug and relevant files.
    - Phase 2 (Diagnose): Run minimal commands to reproduce the failure.

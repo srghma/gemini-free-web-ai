@@ -15,5 +15,5 @@ export const formatExecutionReply = ({
   if (exitCode !== 0) {
     return `PREVIOUS_${lang}_ERROR (status=${exitCode})\n${content}`;
   }
-  return `PREVOUS_${lang}_OUTPUT\n${content}`;
+  return `PREVIOUS_${lang}_OUTPUT\n${content}`;
 };

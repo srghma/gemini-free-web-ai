@@ -16,15 +16,36 @@ export const extractAllChatTurns = (isGlobalPrinting: boolean): ExtractedTurn[] 
     const isUser = !!turn.querySelector('.chat-turn-container.user, [data-turn-role="User"]');
 
     if (isUser) {
-      let userText = turn
-        .querySelector(".turn-content ms-cmark-node, .user-prompt-container .turn-content")
-        ?.textContent?.trim();
+      // AI Studio scrollbar item IDs strip the 'turn-' prefix
+      const cleanId = id.replace(/^turn-/, "");
+      const scrollBtn =
+        document.getElementById(`scrollbar-item-${cleanId}`) ||
+        document.getElementById(`scrollbar-item-${id}`);
+      const scrollText = scrollBtn?.getAttribute("aria-label")?.trim();
 
-      // Virtual scroll fallback
-      if (!userText || userText === "edit\nmore_vert") {
-        const scrollBtn = document.getElementById(`scrollbar-item-${id}`);
-        userText = scrollBtn?.getAttribute("aria-label")?.trim() || userText || "";
+      let userText = scrollText;
+      if (!userText) {
+        const cmarkNodes = Array.from(turn.querySelectorAll("ms-cmark-node"));
+        userText = cmarkNodes
+          .map((n) => n.textContent?.trim())
+          .filter(Boolean)
+          .join("\n\n");
       }
+      if (!userText) {
+        const clone = turn.cloneNode(true) as HTMLElement;
+        const junkEls = clone.querySelectorAll(
+          ".turn-header, .author, .user-name, [data-turn-role], button, mat-icon, .chat-turn-header"
+        );
+        for (const el of junkEls) {
+          el.remove();
+        }
+        userText = clone.innerText?.trim() || "";
+      }
+
+      userText = (userText || "")
+        .replace(/^(?:edit\s+more_vert\s*)?/i, "")
+        .replace(/^(?:User\s+[0-9]{1,2}:[0-9]{2}(?:\s*[AP]M)?\s*)/i, "")
+        .trim();
 
       return {
         id,
@@ -37,22 +58,31 @@ export const extractAllChatTurns = (isGlobalPrinting: boolean): ExtractedTurn[] 
 
     // Model Thinking
     const thoughtNode = turn.querySelector(
-      "ms-thought-chunk ms-cmark-node, .thought-panel ms-cmark-node, ms-thought-chunk ms-text-chunk"
+      "ms-thought-chunk ms-cmark-node, .thought-panel ms-cmark-node, ms-thought-chunk ms-text-chunk, ms-thought-chunk"
     );
-    const thinkingContent = thoughtNode?.textContent?.trim() || undefined;
+    let thinkingContent = thoughtNode?.textContent?.trim() || undefined;
+    if (thinkingContent) {
+      thinkingContent =
+        thinkingContent.replace(/^Thoughts\s+(?:Expand to view model thoughts\s+)?/i, "").trim() ||
+        undefined;
+    }
 
-    // Model Response
-    const textNodes = Array.from(
-      turn.querySelectorAll(
-        "ms-prompt-chunk > ms-text-chunk:not(ms-thought-chunk ms-text-chunk), ms-code-block pre, pre"
-      )
+    // Model Response - Pure clean chat text without code block toolbar buttons or duplicated code
+    const clone = turn.cloneNode(true) as HTMLElement;
+    const modelJunkEls = clone.querySelectorAll(
+      "ms-code-block, ms-thought-chunk, mat-icon, button, .model-prompt-footer"
     );
-    const chatContent =
-      textNodes
-        .map((n) => n.textContent?.trim())
-        .filter(Boolean)
-        .join("\n\n") || undefined;
+    for (const el of modelJunkEls) {
+      el.remove();
+    }
 
+    let chatContent = clone.innerText?.trim() || undefined;
+    if (chatContent) {
+      chatContent =
+        chatContent.replace(/^Model\s+[0-9]{1,2}:[0-9]{2}.*?(?:\n+|$)/i, "").trim() || undefined;
+    }
+
+    // Clean code blocks
     const codeBlocks = Array.from(turn.querySelectorAll<HTMLElement>("ms-code-block pre, pre"))
       .map((p) => p.innerText.trim())
       .filter(Boolean);

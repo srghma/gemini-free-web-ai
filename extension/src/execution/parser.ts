@@ -4,11 +4,18 @@ import type { CommandLanguage, ParsedCommand } from "../types";
 const toCommandLanguage = (rawType: string): CommandLanguage =>
   rawType.toLowerCase().replace("execute_next_", "") as CommandLanguage;
 
-export const extractBridgeCommand = (turnEl: HTMLElement): ParsedCommand | null => {
+const cleanExtractedCode = (code: string): string =>
+  code
+    .replace(/^```[a-z0-9_-]*\r?\n/i, "")
+    .replace(/\r?\n```$/g, "")
+    .trim();
+
+export const extractBridgeCommands = (turnEl: HTMLElement): ParsedCommand[] => {
   const allPres = Array.from(turnEl.querySelectorAll("pre"));
   const fullText = turnEl.innerText || "";
+  const results: ParsedCommand[] = [];
 
-  // Strategy 1: Pair each <pre> with its preceding EXECUTE_NEXT_* trigger
+  // Strategy 1: Pair each <pre> with its closest preceding EXECUTE_NEXT_* trigger
   for (const pre of allPres) {
     try {
       const range = document.createRange();
@@ -16,24 +23,31 @@ export const extractBridgeCommand = (turnEl: HTMLElement): ParsedCommand | null 
       range.setEndBefore(pre);
       const textBefore = range.toString();
 
-      // Uses standard dotAll (/s) flag instead of [^]*
-      const match = textBefore.match(
-        /(EXECUTE_NEXT_PYTHON|EXECUTE_NEXT_BASH|EXECUTE_NEXT_BUN)(?:\(timeout=([0-9]+(?:\.[0-9]+)?(?:s|m|h|d)?)\))?.*$/is
-      );
+      const triggerRegex =
+        /(EXECUTE_NEXT_PYTHON|EXECUTE_NEXT_BASH|EXECUTE_NEXT_BUN)(?:\(timeout=([0-9]+(?:\.[0-9]+)?(?:s|m|h|d)?)\))?/gi;
+      const matches = Array.from(textBefore.matchAll(triggerRegex));
+      const lastMatch = matches[matches.length - 1];
 
-      const rawType = match?.[1];
-      if (rawType) {
-        const timeout = match?.[2] ?? CONFIG.defaultTimeout;
+      if (lastMatch) {
+        const rawType = lastMatch[1];
+        if (!rawType) throw new Error("no rawType");
+        const timeout = lastMatch[2] ?? CONFIG.defaultTimeout;
         const type = toCommandLanguage(rawType);
-        const code = pre.innerText.trim();
-        if (code) return { type, timeout, code, rawType };
+        const code = cleanExtractedCode(pre.innerText);
+        if (code) {
+          results.push({ type, timeout, code, rawType });
+        }
       }
     } catch {
       // Fall through to fallback strategies
     }
   }
 
-  // Strategy 2: Single command in turn with code block
+  if (results.length > 0) {
+    return results;
+  }
+
+  // Strategy 2: Single command fallback if range failed but pre exists
   const fallbackMatch = fullText.match(
     /(EXECUTE_NEXT_PYTHON|EXECUTE_NEXT_BASH|EXECUTE_NEXT_BUN)(?:\(timeout=([0-9]+(?:\.[0-9]+)?(?:s|m|h|d)?)\))?/i
   );
@@ -45,19 +59,26 @@ export const extractBridgeCommand = (turnEl: HTMLElement): ParsedCommand | null 
 
     const firstPre = allPres[0];
     if (firstPre) {
-      const code = firstPre.innerText.trim();
-      if (code) return { type, timeout, code, rawType: fallbackRawType };
+      const code = cleanExtractedCode(firstPre.innerText);
+      if (code) return [{ type, timeout, code, rawType: fallbackRawType }];
     }
 
-    // Strategy 3: Markdown fence fallback (must have closing fence)
-    const bm = fullText.match(/```(?:py|python|bash|sh|zsh|bun|js|ts)?\s*\n([\s\S]*?)```/i);
-    const fencedCode = bm?.[1]?.trim();
+    // Strategy 3: Markdown fence fallback with strict line boundaries
+    const bm = fullText.match(
+      /(?:EXECUTE_NEXT_[A-Z]+(?:\([^\)]*\))?)\s*[\r\n]+```(?:py|python|bash|sh|zsh|bun|js|ts)?\s*\n([\s\S]*?)\n```/i
+    );
+    const fencedCode = bm?.[1] ? cleanExtractedCode(bm[1]) : null;
     if (fencedCode) {
-      return { type, timeout, code: fencedCode, rawType: fallbackRawType };
+      return [{ type, timeout, code: fencedCode, rawType: fallbackRawType }];
     }
   }
 
-  return null;
+  return [];
+};
+
+export const extractBridgeCommand = (turnEl: HTMLElement): ParsedCommand | null => {
+  const commands = extractBridgeCommands(turnEl);
+  return commands[0] ?? null;
 };
 
 /**

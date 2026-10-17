@@ -1,4 +1,7 @@
 import asyncio
+import os
+import select
+import sys
 import time
 import readchar
 from readchar import key as K
@@ -12,20 +15,17 @@ from models import ServerState
 
 console = Console()
 
-try:
-    from pygments import highlight
-    from pygments.formatters import Terminal256Formatter
-    from pygments.lexers import BashLexer, PythonLexer, TypeScriptLexer
-    HAS_PYGMENTS = True
-except ImportError:
-    HAS_PYGMENTS = False
-
-def highlight_code(code: str, lang: str) -> str:
-    if not HAS_PYGMENTS:
-        return code
-    lexer_map = {"python": PythonLexer(), "bash": BashLexer(), "bun": TypeScriptLexer()}
-    lexer = lexer_map.get(lang.lower(), BashLexer())
-    return highlight(code, lexer, Terminal256Formatter(style="monokai")).rstrip()
+def get_key_nonblocking(timeout: float = 0.2) -> str | None:
+    try:
+        fd = sys.stdin.fileno()
+        if not os.isatty(fd):
+            return None
+        r, _, _ = select.select([sys.stdin], [], [], timeout)
+        if r:
+            return readchar.readkey()
+    except Exception:
+        pass
+    return None
 
 def render_tui(height: int, state: ServerState, execution_queue: asyncio.Queue) -> Layout:
     layout = Layout()
@@ -68,7 +68,7 @@ def render_tui(height: int, state: ServerState, execution_queue: asyncio.Queue) 
     switch_hint = escape("[1-9] / [h/l] Switch")
     layout["tabs_bar"].update(Panel(tabs_table, title=f"[bold]Active Chrome Tabs[/bold] [dim]({switch_hint})[/dim]", border_style="dim"))
 
-    # 3. Main Stream View (renders last 8-10 turns + live prompt stream)
+    # 3. Main Stream View
     selected_tab = state.get_selected_tab()
     if not selected_tab or not selected_tab.turns:
         view_content = Text("\n\n  Waiting for chat activity in this tab...", style="dim italic")
@@ -89,8 +89,9 @@ def render_tui(height: int, state: ServerState, execution_queue: asyncio.Queue) 
             if turn.chat_content or turn.code_blocks:
                 status_txt = "streaming..." if turn.status == "streaming" else "ready"
                 elements.append(Text(f"🤖 AI RESPONSE ({status_txt})", style="bold green"))
-                c_msg = (turn.chat_content[:300] + "...") if len(turn.chat_content) > 300 else turn.chat_content
-                elements.append(Panel(Text(c_msg or "(rendering response...)", style="white"), border_style="green"))
+                if turn.chat_content:
+                    c_msg = (turn.chat_content[:300] + "...") if len(turn.chat_content) > 300 else turn.chat_content
+                    elements.append(Panel(Text(c_msg, style="white"), border_style="green"))
 
                 for code in turn.code_blocks:
                     elements.append(Text("⚡ EXECUTION PAYLOAD:", style="bold yellow"))
@@ -134,7 +135,9 @@ def render_tui(height: int, state: ServerState, execution_queue: asyncio.Queue) 
 async def key_listener(state: ServerState, render_event: asyncio.Event):
     loop = asyncio.get_running_loop()
     while not state.stop_requested:
-        k = await loop.run_in_executor(None, readchar.readkey)
+        k = await loop.run_in_executor(None, get_key_nonblocking, 0.2)
+        if not k:
+            continue
         tabs_count = len(state.tabs)
         if k in (K.RIGHT, "l", "L", K.TAB, K.DOWN, "j"):
             if tabs_count:
