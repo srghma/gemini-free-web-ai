@@ -6,7 +6,7 @@ from pathlib import Path
 import struct
 from rich.console import Console
 from rich.markup import escape
-from models import state
+from .models import state
 
 HOST = "127.0.0.1"
 PORT = 8765
@@ -62,7 +62,6 @@ def log_to_file(entry: str):
         state.add_log(f"[red]Log write error: {escape(str(e))}[/red]")
 
 def log_raw_ws(direction: str, tab_id: str, message: str):
-    """Appends all incoming/outgoing websocket traffic and events with high-resolution timestamp."""
     try:
         RAW_LOG_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]

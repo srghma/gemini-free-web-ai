@@ -1,35 +1,22 @@
 import { CONFIG } from "../config";
-import { submitPrompt } from "../dom/promptBox";
-import { formatExecutionReply } from "../execution/formatter";
-import type { ExtractedTurn } from "../types";
-import type { DaemonExecutionResponse, PromptBoxStatus } from "../types";
+import type { ExtractedTurn, PreferenceVoteData, PromptBoxStatus } from "../types";
 import type { StatusBadgeManager } from "../ui/statusBadge";
-
-export interface QueuedTask {
-  type: string;
-  code: string;
-  timeout: string;
-}
 
 export interface InitialDataPayload {
   turns: ExtractedTurn[];
   prompt: PromptBoxStatus;
+  preferenceVote: PreferenceVoteData | null;
 }
+
+export type CommandHandler = (payload: Record<string, unknown>) => void | Promise<void>;
 
 export class BridgeWebSocket {
   private socket: WebSocket | null = null;
   private isReconnecting = false;
   private retryDelayMs = 2000;
-  private pendingQueue: QueuedTask[] = [];
-  private onSelectVariantHandler: ((variantIndex: number) => void) | null = null;
-  private initialDataProvider: (() => InitialDataPayload) | null = null;
   private isManuallyDisabled = false;
-
-  // Batch execution state
-  private batchQueue: QueuedTask[][] = [];
-  private activeBatch: QueuedTask[] = [];
-  private activeBatchOutputs: string[] = [];
-  private isBatchExecuting = false;
+  private commandHandlers = new Map<string, CommandHandler>();
+  private initialDataProvider: (() => InitialDataPayload) | null = null;
 
   constructor(
     private statusBadge: StatusBadgeManager,
@@ -42,8 +29,8 @@ export class BridgeWebSocket {
     this.initialDataProvider = provider;
   }
 
-  public onSelectVariant(handler: (variantIndex: number) => void): void {
-    this.onSelectVariantHandler = handler;
+  public onCommand(command: string, handler: CommandHandler): void {
+    this.commandHandlers.set(command, handler);
   }
 
   public disable(): void {
@@ -91,34 +78,23 @@ export class BridgeWebSocket {
         turns: initData?.turns ?? [],
         promptText: initData?.prompt.promptText ?? "",
         buttonLabel: initData?.prompt.buttonLabel ?? "Run",
+        preferenceVote: initData?.preferenceVote ?? null,
       });
-
-      this.flushQueue();
     };
 
     this.socket.onmessage = async (event: MessageEvent) => {
       try {
         const data = JSON.parse(event.data);
+        const command = data.command;
 
-        if (data.command === "select_variant") {
-          const idx = typeof data.variantIndex === "number" ? data.variantIndex : 0;
-          this.onSelectVariantHandler?.(idx);
+        if (data.status === "running") {
+          this.statusBadge.setRunning(data.type, data.timeout);
           return;
         }
 
-        const execResp = data as DaemonExecutionResponse;
-        if (execResp.status === "running") {
-          this.statusBadge.setRunning(execResp.type, execResp.timeout);
-          return;
-        }
-
-        this.statusBadge.setFinished(execResp.type, execResp.exitCode ?? 0, execResp.output || "");
-
-        if (this.isBatchExecuting) {
-          this.activeBatchOutputs.push(formatExecutionReply(execResp));
-          this.advanceBatchExecution();
-        } else {
-          await submitPrompt(formatExecutionReply(execResp));
+        if (command && this.commandHandlers.has(command)) {
+          const handler = this.commandHandlers.get(command);
+          await handler?.(data);
         }
       } catch (err) {
         console.error("[Bridge] Failed parsing daemon message:", err);
@@ -153,65 +129,5 @@ export class BridgeWebSocket {
       return true;
     }
     return false;
-  }
-
-  public sendTaskBatch(tasks: QueuedTask[]): boolean {
-    if (this.isManuallyDisabled || tasks.length === 0) return false;
-    this.batchQueue.push(tasks);
-    this.processNextBatch();
-    return true;
-  }
-
-  public sendTask(type: string, code: string, timeout: string): boolean {
-    return this.sendTaskBatch([{ type, code, timeout }]);
-  }
-
-  private processNextBatch(): void {
-    if (this.isBatchExecuting || this.batchQueue.length === 0) return;
-    const nextBatch = this.batchQueue.shift();
-    if (!nextBatch) return;
-    this.activeBatch = nextBatch;
-    this.activeBatchOutputs = [];
-    this.isBatchExecuting = true;
-    this.advanceBatchExecution();
-  }
-
-  private advanceBatchExecution(): void {
-    if (this.activeBatch.length > 0) {
-      const nextTask = this.activeBatch.shift();
-      if (!nextTask) throw new Error("nextTask empty");
-      this.dispatchTask(nextTask);
-    } else {
-      const finalReply = this.activeBatchOutputs.join("\n\n");
-      this.isBatchExecuting = false;
-      if (finalReply) {
-        submitPrompt(finalReply).catch((err) => {
-          console.error("[Bridge] Failed submitting execution reply:", err);
-        });
-      }
-      this.processNextBatch();
-    }
-  }
-
-  private dispatchTask(task: QueuedTask): void {
-    if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-      this.send({
-        command: `execute-${task.type}-and-send-output-to`,
-        tabId: this.tabId,
-        type: task.type,
-        timeout: task.timeout,
-        code: task.code,
-      });
-    } else {
-      this.pendingQueue.push(task);
-    }
-  }
-
-  private flushQueue(): void {
-    while (this.pendingQueue.length > 0) {
-      const task = this.pendingQueue.shift();
-      if (!task) break;
-      this.dispatchTask(task);
-    }
   }
 }

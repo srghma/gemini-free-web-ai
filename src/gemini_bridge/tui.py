@@ -13,7 +13,7 @@ from rich.segment import Segment, Segments
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
-from models import ServerState, TabSession
+from .models import ServerState, TabSession
 
 console = Console()
 
@@ -66,6 +66,13 @@ def render_chat_view(selected_tab: TabSession | None, width: int, height: int) -
                 syntax = Syntax(cb.code, lang, theme="monokai", line_numbers=True, word_wrap=True)
                 elements.append(Panel(syntax, title=f"⚡ PAYLOAD: {lang.upper()}", border_style="yellow"))
 
+    if selected_tab.preference_vote:
+        vote = selected_tab.preference_vote
+        vote_lines = [f"[bold yellow]⚖️ Preference Vote Pending ({len(vote.options)} options)[/bold yellow]"]
+        for opt in vote.options:
+            vote_lines.append(f"  • Option {opt.index + 1} ({opt.side}): {opt.text[:80]}...")
+        elements.append(Panel(Text.from_markup("\n".join(vote_lines)), title="⚖️ PREFERENCE VOTE", border_style="yellow"))
+
     inner_width = max(20, width - 4)
     inner_height = max(5, height - 2)
 
@@ -101,8 +108,6 @@ def render_chat_view(selected_tab: TabSession | None, width: int, height: int) -
 
 def render_tui(height: int, state: ServerState, execution_queue: asyncio.Queue) -> Layout:
     layout = Layout()
-    # Left: Chat View (scrollable, follows bottom)
-    # Right: Sidebar (everything else)
     layout.split_row(
         Layout(name="chat_view", ratio=6),
         Layout(name="sidebar", ratio=4),
@@ -158,7 +163,11 @@ def render_tui(height: int, state: ServerState, execution_queue: asyncio.Queue) 
     cur_task = state.current_executing_task
     if cur_task:
         task_tab = escape(f"[{cur_task['tab_id']}]")
-        exec_banner = f"[bold yellow]▶ ACTIVE: {cur_task['lang'].upper()} on {task_tab}[/bold yellow]\n[dim]Running for {time.time() - cur_task['start']:.1f}s (timeout: {cur_task['timeout']:.0f}s)[/dim]"
+        step_str = f"({cur_task.get('idx', 1)}/{cur_task.get('total', 1)}) " if 'total' in cur_task else ""
+        exec_banner = (
+            f"[bold yellow]▶ ACTIVE: {step_str}{cur_task['lang'].upper()} on {task_tab}[/bold yellow]\n"
+            f"[dim]Running for {time.time() - cur_task['start']:.1f}s (timeout: {cur_task['timeout']:.0f}s)[/dim]"
+        )
     else:
         exec_banner = "[dim]Queue idle - waiting for tasks[/dim]"
     layout["sidebar"]["active_task"].update(Panel(Text.from_markup(exec_banner), title="[bold]Active Task[/bold]", border_style="yellow" if cur_task else "dim"))
@@ -191,7 +200,6 @@ async def key_listener(state: ServerState, render_event: asyncio.Event):
         tabs_count = len(state.tabs)
         cur_tab = state.get_selected_tab()
 
-        # Tab Switching
         if k in (K.RIGHT, "l", "L", K.TAB):
             if tabs_count:
                 state.user_manually_selected = True
@@ -204,7 +212,6 @@ async def key_listener(state: ServerState, render_event: asyncio.Event):
             state.user_manually_selected = True
             state.selected_tab_idx = int(k) - 1
 
-        # Chat Scrolling
         elif k in (K.UP, "k", "K"):
             if cur_tab:
                 cur_tab.follow_bottom = False
@@ -232,7 +239,6 @@ async def key_listener(state: ServerState, render_event: asyncio.Event):
                 cur_tab.scroll_offset = 0
                 cur_tab.follow_bottom = True
 
-        # Quit
         elif k in ("q", "Q", K.CTRL_C, K.CTRL_D):
             state.stop_requested = True
             render_event.set()

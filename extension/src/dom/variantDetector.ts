@@ -1,77 +1,75 @@
-import type { ProposedVariant } from "../types";
+import type { PreferenceOption, PreferenceVoteData } from "../types";
+import { sleep, waitFor } from "./angular";
 
-export interface VariantDetectionResult {
-  hasVariants: boolean;
-  variants: ProposedVariant[];
-}
+export const detectPreferenceVote = (): PreferenceVoteData | null => {
+  const voteEl = document.querySelector<HTMLElement>("ms-inline-preference-vote");
+  if (!voteEl) return null;
 
-export const detectProposedVariants = (): VariantDetectionResult => {
-  const fullText = document.body.innerText || "";
-  const isPreferencePrompt = /which response do you prefer|which answer do you prefer/i.test(
-    fullText
+  const header =
+    voteEl.querySelector(".inline-preference-header")?.textContent?.trim() ||
+    "Which response do you prefer?";
+
+  const optionButtons = Array.from(
+    voteEl.querySelectorAll<HTMLElement>("button.inline-preference-option, [data-test-side]")
   );
+  if (optionButtons.length === 0) return null;
 
-  const allButtons = Array.from(document.querySelectorAll<HTMLElement>("button, [role='button']"));
+  const options: PreferenceOption[] = optionButtons.map((btn, idx) => {
+    const sideAttr = btn.getAttribute("data-test-side");
+    const side: "left" | "right" = sideAttr === "right" || idx === 1 ? "right" : "left";
+    const text = btn.innerText?.trim() || "";
+    return { index: idx, side, text };
+  });
 
-  const r1Btn = allButtons.find((b) =>
-    /^(?:response|candidate|option|variant|draft)\s*1\b/i.test(
-      (b.innerText || b.getAttribute("aria-label") || "").trim()
-    )
-  );
-  const r2Btn = allButtons.find((b) =>
-    /^(?:response|candidate|option|variant|draft)\s*2\b/i.test(
-      (b.innerText || b.getAttribute("aria-label") || "").trim()
-    )
-  );
+  const submitBtn = voteEl.querySelector<HTMLButtonElement>('button[data-test-id="submit-button"]');
+  const isSubmitDisabled =
+    !submitBtn || submitBtn.disabled || submitBtn.getAttribute("aria-disabled") === "true";
 
-  if (isPreferencePrompt || (r1Btn && r2Btn)) {
-    const textChunks = Array.from(
-      document.querySelectorAll<HTMLElement>(
-        ".model-prompt-container, .turn-content, ms-prompt-chunk"
-      )
-    ).filter((c) => (c.innerText || "").length > 20);
-
-    const v1Text =
-      (r1Btn?.closest(".turn-content, .model-prompt-container") as HTMLElement)?.innerText ||
-      textChunks[0]?.innerText ||
-      "Variant 1";
-    const v2Text =
-      (r2Btn?.closest(".turn-content, .model-prompt-container") as HTMLElement)?.innerText ||
-      textChunks[1]?.innerText ||
-      "Variant 2";
-
-    return {
-      hasVariants: true,
-      variants: [
-        { index: 0, label: "Response 1", textSnippet: v1Text.slice(0, 300) },
-        { index: 1, label: "Response 2", textSnippet: v2Text.slice(0, 300) },
-      ],
-    };
-  }
-
-  return { hasVariants: false, variants: [] };
+  return {
+    question: header,
+    options,
+    hasSubmitButton: !!submitBtn,
+    isSubmitDisabled,
+  };
 };
 
-export const clickVariantChoice = (index: number): boolean => {
-  const allButtons = Array.from(document.querySelectorAll<HTMLElement>("button, [role='button']"));
+export const clickVariantChoice = async (index: number): Promise<boolean> => {
+  const voteEl = document.querySelector<HTMLElement>("ms-inline-preference-vote");
+  if (!voteEl) return false;
 
-  const targetRegex =
-    index === 0
-      ? /^(?:response|candidate|option|variant|draft)\s*1\b/i
-      : /^(?:response|candidate|option|variant|draft)\s*2\b/i;
+  const targetSelector = index === 0 ? '[data-test-side="left"]' : '[data-test-side="right"]';
+  let targetBtn = voteEl.querySelector<HTMLElement>(targetSelector);
+  if (!targetBtn) {
+    const optionButtons = Array.from(
+      voteEl.querySelectorAll<HTMLElement>("button.inline-preference-option")
+    );
+    targetBtn = optionButtons[index] ?? null;
+  }
 
-  const btn = allButtons.find((b) =>
-    targetRegex.test((b.innerText || b.getAttribute("aria-label") || "").trim())
+  if (targetBtn) {
+    targetBtn.click();
+    await sleep(250);
+  }
+
+  // Submit button becomes enabled once choice is selected
+  const submitBtn = await waitFor(
+    () => {
+      const btn = voteEl.querySelector<HTMLButtonElement>('button[data-test-id="submit-button"]');
+      if (btn && !btn.disabled && btn.getAttribute("aria-disabled") !== "true") return btn;
+      return null;
+    },
+    2000,
+    50
   );
 
-  if (btn) {
-    btn.click();
+  if (submitBtn) {
+    submitBtn.click();
+    await sleep(200);
     return true;
   }
 
-  const skipBtn = allButtons.find((b) =>
-    /^skip$/i.test((b.innerText || b.getAttribute("aria-label") || "").trim())
-  );
+  // Fallback to skip button if submit is not clickable
+  const skipBtn = voteEl.querySelector<HTMLButtonElement>('button[data-test-id="skip-button"]');
   if (skipBtn) {
     skipBtn.click();
     return true;

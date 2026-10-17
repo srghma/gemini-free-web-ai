@@ -14,7 +14,6 @@ class ExecutionResult:
     timed_out: bool
     exit_code: int
 
-
 def parse_timeout(val: str | None, default: float = 60.0) -> float:
     """Parse timeout strings like '2h', '30m', '45s', '1d'. Default: 60s."""
     if not val:
@@ -24,7 +23,6 @@ def parse_timeout(val: str | None, default: float = 60.0) -> float:
         return default
     num, unit = match.groups()
     return float(num) * TIMEOUT_UNITS.get(unit or "s", 1.0)
-
 
 def format_interleaved(segments: list[tuple[str, str]]) -> str:
     """Interleave stdout ('o') and stderr ('e')."""
@@ -44,7 +42,6 @@ def format_interleaved(segments: list[tuple[str, str]]) -> str:
 
     return "".join(result)
 
-
 def get_execution_env() -> dict[str, str]:
     env = dict(os.environ)
     home = str(Path.home())
@@ -58,16 +55,13 @@ def get_execution_env() -> dict[str, str]:
     env["PATH"] = ":".join([p for p in extra_paths if p not in cur_path] + [cur_path])
     return env
 
-
 def get_default_work_dir() -> str:
     repo = Path.home() / "projects" / "gemini-free-web-ai"
     if repo.exists():
         return str(repo)
     return str(Path.cwd())
 
-
 async def run_subprocess_interleaved(cmd: list[str], cwd: str, timeout: float) -> ExecutionResult:
-    """Execute command in a new process group, read stdout/stderr concurrently, handle timeout."""
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -111,7 +105,6 @@ async def run_subprocess_interleaved(cmd: list[str], cwd: str, timeout: float) -
             timed_out=True,
             exit_code=124,
         )
-
 
 async def execute_task(lang: str, code: str, timeout: float) -> ExecutionResult:
     ext_map = {"python": ".py", "bash": ".sh", "bun": ".ts"}

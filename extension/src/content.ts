@@ -1,9 +1,8 @@
 import { CONFIG } from "./config";
 import { extractAllChatTurns } from "./dom/chatExtractor";
 import { ensurePresetSelected } from "./dom/preset";
-import { getPromptBoxStatus } from "./dom/promptBox";
-import { clickVariantChoice, detectProposedVariants } from "./dom/variantDetector";
-import { TurnSettler, extractBridgeCommands } from "./execution/parser";
+import { getPromptBoxStatus, submitPrompt } from "./dom/promptBox";
+import { clickVariantChoice, detectPreferenceVote } from "./dom/variantDetector";
 import { StatusBadgeManager } from "./ui/statusBadge";
 import { BridgeWebSocket } from "./ws/client";
 
@@ -11,61 +10,60 @@ import { BridgeWebSocket } from "./ws/client";
   const tabId = `tab_${Math.random().toString(36).substring(2, 7)}`;
   const statusBadge = new StatusBadgeManager();
   const wsClient = new BridgeWebSocket(statusBadge, tabId);
-  const turnSettler = new TurnSettler();
 
-  const handledTurnIds = new Set<string>();
   let lastDigest = "";
-  let lastVariantPromptTime = 0;
 
-  wsClient.setInitialDataProvider(() => ({
-    turns: extractAllChatTurns(false).slice(-10),
-    prompt: getPromptBoxStatus(),
-  }));
+  wsClient.setInitialDataProvider(() => {
+    const promptStatus = getPromptBoxStatus();
+    return {
+      turns: extractAllChatTurns(false).slice(-15),
+      prompt: promptStatus,
+      preferenceVote: detectPreferenceVote(),
+    };
+  });
 
   statusBadge.onToggle((enabled) => {
-    if (enabled) {
-      wsClient.enable();
-    } else {
-      wsClient.disable();
+    if (enabled) wsClient.enable();
+    else wsClient.disable();
+  });
+
+  // Server commands
+  wsClient.onCommand("submit_prompt", async (payload) => {
+    const text = typeof payload.text === "string" ? payload.text : "";
+    if (text) {
+      statusBadge.setReady("Submitting Reply...");
+      await submitPrompt(text);
+      statusBadge.setReady("Daemon Ready");
     }
   });
 
-  wsClient.onSelectVariant((idx) => {
-    console.log(`[Bridge] Server requested variant selection: #${idx}`);
-    clickVariantChoice(idx);
+  wsClient.onCommand("select_variant", async (payload) => {
+    const idx = typeof payload.variantIndex === "number" ? payload.variantIndex : 0;
+    statusBadge.setReady(`Selecting Variant #${idx + 1}...`);
+    await clickVariantChoice(idx);
+    statusBadge.setReady("Daemon Ready");
   });
 
   const syncState = (): void => {
     if (statusBadge.isDisabled) return;
 
+    statusBadge.render();
     const promptStatus = getPromptBoxStatus();
-    const turns = Array.from(document.querySelectorAll<HTMLElement>("ms-chat-turn"));
-    const latestTurn = turns[turns.length - 1] ?? null;
-
-    const { isPrinting: settlerPrinting, isSettled } = turnSettler.check(latestTurn);
-    const isGlobalPrinting = promptStatus.isAiPrinting || settlerPrinting;
-
+    const preferenceVote = detectPreferenceVote();
+    const isGlobalPrinting = promptStatus.isAiPrinting;
     const extractedTurns = extractAllChatTurns(isGlobalPrinting);
-
-    const variantResult = detectProposedVariants();
-    if (variantResult.hasVariants && Date.now() - lastVariantPromptTime > 4000) {
-      lastVariantPromptTime = Date.now();
-      wsClient.send({
-        event: "variants_proposed",
-        tabId,
-        variants: variantResult.variants,
-      });
-    }
 
     const currentDigest = JSON.stringify({
       isGlobalPrinting,
       btn: promptStatus.buttonLabel,
       promptText: promptStatus.promptText,
+      hasVote: !!preferenceVote,
+      voteCount: preferenceVote?.options.length ?? 0,
       turns: extractedTurns.map((t) => [
         t.id,
         t.status,
         t.chatContent?.length,
-        t.thinkingContent?.length,
+        t.codeBlocks.length,
       ]),
     });
 
@@ -78,33 +76,11 @@ import { BridgeWebSocket } from "./ws/client";
         buttonLabel: promptStatus.buttonLabel,
         promptText: promptStatus.promptText,
         turns: extractedTurns,
+        preferenceVote,
       });
     }
 
     statusBadge.render(promptStatus);
-
-    if (!latestTurn || isGlobalPrinting || !isSettled) return;
-
-    const isModelTurn = !latestTurn.querySelector(
-      '.chat-turn-container.user, [data-turn-role="User"]'
-    );
-    if (!isModelTurn) return;
-
-    const turnId = latestTurn.id || latestTurn.getAttribute("id") || "";
-    if (turnId && handledTurnIds.has(turnId)) return;
-
-    const parsedCommands = extractBridgeCommands(latestTurn);
-    if (parsedCommands.length === 0) {
-      if (turnId) handledTurnIds.add(turnId);
-      return;
-    }
-
-    if (turnId) handledTurnIds.add(turnId);
-    console.log(`[Bridge] Dispatched ${parsedCommands.length} command(s) for turn ${turnId}`);
-    const parsedCommand = parsedCommands[0];
-    if (!parsedCommand) throw new Error("parsedCommand empty");
-    statusBadge.setRunning(parsedCommand.type);
-    wsClient.sendTaskBatch(parsedCommands);
   };
 
   document.addEventListener(

@@ -9,6 +9,19 @@ class CodeBlock:
     code: str
 
 @dataclass
+class PreferenceOption:
+    index: int
+    side: str
+    text: str
+
+@dataclass
+class PreferenceVote:
+    question: str
+    options: list[PreferenceOption] = field(default_factory=list)
+    has_submit_button: bool = True
+    is_submit_disabled: bool = False
+
+@dataclass
 class ChatTurn:
     id: str
     type: str  # user, ai_thinking, ai_chat, ai_both
@@ -25,18 +38,20 @@ class TabSession:
     is_printing: bool = False
     button_label: str = "Run"
     prompt_text: str = ""
-    variants: list[dict] = field(default_factory=list)
+    preference_vote: PreferenceVote | None = None
     turns: list[ChatTurn] = field(default_factory=list)
     last_seen: datetime = field(default_factory=datetime.now)
     scroll_offset: int = 0
     follow_bottom: bool = True
+    handled_turn_ids: set[str] = field(default_factory=set)
+    handled_vote_keys: set[str] = field(default_factory=set)
 
     def merge_turns(self, raw_turns: list[dict]):
         if not raw_turns:
             return
 
-        existing_by_id = {t.id: t for t in self.turns}
-        updated_turns: list[ChatTurn] = []
+        turn_order: list[str] = [t.id for t in self.turns]
+        turns_map: dict[str, ChatTurn] = {t.id: t for t in self.turns}
 
         for rt in raw_turns:
             tid = rt.get("id") or ""
@@ -57,14 +72,13 @@ class TabSession:
             new_type = rt.get("type", "ai_chat")
             new_status = rt.get("status", "completed")
 
-            existing = existing_by_id.get(tid)
+            existing = turns_map.get(tid)
 
             user_content = new_user or (existing.user_content if existing else "")
             thinking_content = new_thinking or (existing.thinking_content if existing else "")
             chat_content = new_chat or (existing.chat_content if existing else "")
             code_blocks = cbs if cbs else (existing.code_blocks if existing else [])
 
-            # Filter phantom empty turns
             if not user_content and not thinking_content and not chat_content and not code_blocks:
                 continue
 
@@ -77,10 +91,11 @@ class TabSession:
                 chat_content=chat_content,
                 code_blocks=code_blocks,
             )
-            updated_turns.append(turn)
-            existing_by_id[tid] = turn
+            turns_map[tid] = turn
+            if tid not in turn_order:
+                turn_order.append(tid)
 
-        self.turns = updated_turns
+        self.turns = [turns_map[tid] for tid in turn_order if tid in turns_map]
 
 class ServerState:
     def __init__(self):
@@ -110,4 +125,3 @@ class ServerState:
 
 state = ServerState()
 render_event = asyncio.Event()
-execution_queue: asyncio.Queue[tuple[asyncio.StreamWriter, dict]] = asyncio.Queue()

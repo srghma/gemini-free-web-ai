@@ -1,6 +1,6 @@
 [project]
 name = "gemini-free-web-ai"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local daemon bridge for Google AI Studio"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -10,8 +10,18 @@ dependencies = [
     "pygments>=2.17.0",
 ]
 
-[tool.uv]
-package = false
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[project.scripts]
+gemini-bridge = "gemini_bridge.server:main_cli"
 
 [tool.hatch.build.targets.wheel]
-packages = ["."]
+packages = ["src/gemini_bridge"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+asyncio_mode = "auto"

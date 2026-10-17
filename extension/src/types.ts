@@ -1,12 +1,3 @@
-export type CommandLanguage = "python" | "bash" | "bun";
-
-export interface ParsedCommand {
-  type: CommandLanguage;
-  timeout: string;
-  code: string;
-  rawType: string;
-}
-
 export interface ExtractedCodeBlock {
   language: string;
   code: string;
@@ -22,15 +13,17 @@ export interface ExtractedTurn {
   codeBlocks: ExtractedCodeBlock[];
 }
 
-export interface DaemonExecutionResponse {
-  status: "completed" | "error" | "timeout" | "running";
-  type: CommandLanguage;
-  output?: string;
-  timedOut?: boolean;
-  exitCode?: number;
-  timeout?: string;
-  command?: string;
-  variantIndex?: number;
+export interface PreferenceOption {
+  index: number;
+  side: "left" | "right";
+  text: string;
+}
+
+export interface PreferenceVoteData {
+  question: string;
+  options: PreferenceOption[];
+  hasSubmitButton: boolean;
+  isSubmitDisabled: boolean;
 }
 
 export interface PromptBoxStatus {
@@ -40,12 +33,6 @@ export interface PromptBoxStatus {
   buttonLabel: string;
   isButtonDisabled: boolean;
   isAiPrinting: boolean;
-}
-
-export interface ProposedVariant {
-  index: number;
-  label: string;
-  textSnippet: string;
 }
 
 export type BridgeConnectionStatus = "ready" | "running" | "error" | "offline";

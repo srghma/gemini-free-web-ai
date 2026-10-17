@@ -9,12 +9,10 @@ const cleanExtractedCode = (code: string): string =>
     .trim();
 
 const detectCodeLanguage = (cb: HTMLElement, precedingText = ""): string => {
-  // 1. Check preceding EXECUTE_NEXT trigger
   if (/EXECUTE_NEXT_PYTHON/i.test(precedingText)) return "python";
   if (/EXECUTE_NEXT_BUN/i.test(precedingText)) return "typescript";
   if (/EXECUTE_NEXT_BASH/i.test(precedingText)) return "bash";
 
-  // 2. Check header/button labels inside the code block
   const headerText =
     cb.querySelector(
       "mat-panel-title, mat-expansion-panel-header, .code-block-header, .header, .language-label"
@@ -26,7 +24,6 @@ const detectCodeLanguage = (cb: HTMLElement, precedingText = ""): string => {
   if (/\b(?:js|javascript)\b/i.test(headerText)) return "javascript";
   if (/\b(?:json)\b/i.test(headerText)) return "json";
 
-  // 3. Check language attributes
   const langAttr = cb.getAttribute("language") || cb.getAttribute("data-language");
   if (langAttr) return langAttr.toLowerCase();
 
@@ -48,13 +45,11 @@ export const extractAllChatTurns = (isGlobalPrinting: boolean): ExtractedTurn[] 
     const isUser = !!turn.querySelector('.chat-turn-container.user, [data-turn-role="User"]');
 
     if (isUser) {
-      // 1. Check scrollbar item aria-label
       const scrollBtn =
         document.getElementById(`scrollbar-item-${cleanId}`) ||
         document.getElementById(`scrollbar-item-${id}`);
       let userText = scrollBtn?.getAttribute("aria-label")?.trim();
 
-      // 2. Check cmark nodes
       if (!userText) {
         const cmarkNodes = Array.from(turn.querySelectorAll("ms-cmark-node"));
         userText = cmarkNodes
@@ -63,7 +58,6 @@ export const extractAllChatTurns = (isGlobalPrinting: boolean): ExtractedTurn[] 
           .join("\n\n");
       }
 
-      // 3. Fallback to innerText clone
       if (!userText) {
         const clone = turn.cloneNode(true) as HTMLElement;
         const junkEls = clone.querySelectorAll(
@@ -80,12 +74,10 @@ export const extractAllChatTurns = (isGlobalPrinting: boolean): ExtractedTurn[] 
         .replace(/^(?:User\s+[0-9]{1,2}:[0-9]{2}(?:\s*[AP]M)?\s*)/i, "")
         .trim();
 
-      // If virtual scrolling emptied the DOM, recover from cache
       if (!userText && cachedTurn?.userContent) {
         userText = cachedTurn.userContent;
       }
 
-      // Skip phantom empty turns without any text or scrollbar entry
       if (!userText) return;
 
       const extracted: ExtractedTurn = {
@@ -120,7 +112,7 @@ export const extractAllChatTurns = (isGlobalPrinting: boolean): ExtractedTurn[] 
       thinkingContent = cachedTurn.thinkingContent;
     }
 
-    // Code blocks with language detection
+    // Code blocks
     const fullText = turn.innerText || "";
     const codeBlocks: ExtractedCodeBlock[] = Array.from(
       turn.querySelectorAll<HTMLElement>("ms-code-block")
@@ -149,16 +141,12 @@ export const extractAllChatTurns = (isGlobalPrinting: boolean): ExtractedTurn[] 
     let chatContent = clone.innerText?.trim() || undefined;
     if (chatContent) {
       chatContent =
-        chatContent
-          .replace(/^Model\s+[0-9]{1,2}:[0-9]{2}.*?(?:\n+|$)/i, "")
-          .replace(/(?:EXECUTE_NEXT_PYTHON|EXECUTE_NEXT_BASH|EXECUTE_NEXT_BUN)(?:\([^)]*\))?/gi, "")
-          .trim() || undefined;
+        chatContent.replace(/^Model\s+[0-9]{1,2}:[0-9]{2}.*?(?:\n+|$)/i, "").trim() || undefined;
     }
     if (!chatContent && cachedTurn?.chatContent) {
       chatContent = cachedTurn.chatContent;
     }
 
-    // Skip virtualized empty turns that have no content
     if (!thinkingContent && !chatContent && effectiveCodeBlocks.length === 0) {
       return;
     }

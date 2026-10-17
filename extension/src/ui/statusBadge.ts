@@ -5,9 +5,7 @@ export class StatusBadgeManager {
     status: "offline" as BridgeConnectionStatus,
     label: "Connecting...",
     lastCmd: null as string | null,
-    lastExit: null as number | null,
     lastElapsed: null as string | null,
-    lastOutput: "",
   };
 
   private startTime = 0;
@@ -43,21 +41,9 @@ export class StatusBadgeManager {
     this.render();
   }
 
-  public setFinished(type: string, exitCode: number, output = ""): void {
+  public setReady(msg = "Daemon Ready"): void {
     if (this.isUserDisabled) return;
     if (this.timerInterval) clearInterval(this.timerInterval);
-    const elapsed = `${((Date.now() - this.startTime) / 1000).toFixed(1)}s`;
-    this.state.status = exitCode === 0 ? "ready" : "error";
-    this.state.label = "Ready";
-    this.state.lastCmd = (type || "").toUpperCase();
-    this.state.lastExit = exitCode;
-    this.state.lastElapsed = elapsed;
-    this.state.lastOutput = output;
-    this.render();
-  }
-
-  public setReady(msg = "Ready"): void {
-    if (this.isUserDisabled) return;
     this.state.status = "ready";
     this.state.label = msg;
     this.render();
@@ -73,16 +59,20 @@ export class StatusBadgeManager {
 
   public render(promptStatus?: PromptBoxStatus): void {
     if (promptStatus) this.lastPromptStatus = promptStatus;
-    const headerRight = document.querySelector("ms-header .toolbar-right");
-    if (!headerRight) return;
+    const container =
+      document.querySelector("ms-header .toolbar-right") ||
+      document.querySelector("ms-header") ||
+      document.querySelector("ms-playground-toolbar");
+
+    if (!container) return;
 
     let badge = document.getElementById("gemini-bridge-status");
     if (!badge) {
       badge = document.createElement("div");
       badge.id = "gemini-bridge-status";
       badge.style.cssText =
-        "display:inline-flex;align-items:center;gap:6px;padding:3px 8px;margin-right:8px;border-radius:12px;font-size:11px;font-family:monospace;font-weight:600;user-select:none;";
-      headerRight.prepend(badge);
+        "display:inline-flex;align-items:center;gap:6px;padding:3px 8px;margin-right:8px;border-radius:12px;font-size:11px;font-family:monospace;font-weight:600;user-select:none;z-index:9999;";
+      container.prepend(badge);
     }
 
     const STYLES = {
@@ -120,21 +110,12 @@ export class StatusBadgeManager {
     badge.style.border = `1px solid ${style.border}`;
 
     let labelText = `${style.icon} ${this.isUserDisabled ? "Bridge Disabled" : this.state.label}`;
-    if (!this.isUserDisabled && this.state.lastCmd && this.state.status !== "running") {
-      const exitIcon = this.state.lastExit === 0 ? "✓" : `✗(${this.state.lastExit})`;
-      labelText += ` [${exitIcon} ${this.state.lastCmd} ${this.state.lastElapsed}]`;
-    }
-
     const ps = this.lastPromptStatus;
     if (ps && !this.isUserDisabled) {
       const aiTag = ps.isAiPrinting ? " | ✍️ Printing" : " | ⏸ Idle";
-      const btnState = ps.isButtonDisabled ? "dis" : "act";
-      const btnTag = ` | ${ps.buttonLabel}(${btnState})`;
-      const inputTag = ps.hasText ? ` | ${ps.charCount}c` : " | (empty)";
-      labelText += `${aiTag}${btnTag}${inputTag}`;
+      labelText += aiTag;
     }
 
-    // Text Span
     let textSpan = badge.querySelector<HTMLSpanElement>("#gemini-bridge-text");
     if (!textSpan) {
       textSpan = document.createElement("span");
@@ -143,7 +124,6 @@ export class StatusBadgeManager {
     }
     textSpan.innerText = labelText;
 
-    // Disconnect / Connect Button
     let btn = badge.querySelector<HTMLButtonElement>("#gemini-bridge-toggle-btn");
     if (!btn) {
       btn = document.createElement("button");
@@ -155,21 +135,12 @@ export class StatusBadgeManager {
       btn.addEventListener("click", (e) => {
         e.stopPropagation();
         this.isUserDisabled = !this.isUserDisabled;
-        if (this.isUserDisabled) {
-          if (this.timerInterval) clearInterval(this.timerInterval);
-        }
+        if (this.isUserDisabled && this.timerInterval) clearInterval(this.timerInterval);
         this.render();
         this.onToggleCallback?.(!this.isUserDisabled);
       });
     }
 
     btn.innerText = this.isUserDisabled ? "🔌 Connect" : "✕ Disconnect";
-    btn.title = this.isUserDisabled
-      ? "Re-enable bridge connection for this tab"
-      : "Disconnect tab from daemon as if closed";
-
-    badge.title = this.state.lastOutput
-      ? `Last Output (${this.state.lastCmd}):\n${this.state.lastOutput.slice(0, 400)}`
-      : "Gemini Local Bridge";
   }
 }
