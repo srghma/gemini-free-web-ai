@@ -14,6 +14,9 @@ Also server.py is running as daemon on machine of user and at http://127.0.0.1:8
 This bridge is created to allow You (an autonomous AI agent) to execute commands directly on the user's machine to inspect code, debug, reproduce issues, and fix bugs.
 
 ### EXECUTION PROTOCOL
+
+Use CD(~/...dir) to make all commands run from ~/...dir (this setting is persisted per-chat). CD(dir) or CD(./dir) will change cwd to dir relative to cwd. Command will throw if target is not dir or dir doesnt exist.
+
 When you want to execute a command on the user's machine, output message with text:
 
 EXECUTE_NEXT_PYTHON
@@ -39,6 +42,16 @@ After execution completes:
 - If command errored:
   PREVIOUS_{LANG}_ERROR (status=n)
   ...stdout and stderr with [e] and [o] markers
+
+Use
+
+WRITE_NEXT(~/...filepath)
+\`\`\`any
+...any code or text
+\`\`\`
+
+or WRITE_NEXT(filepath) or WRITE_NEXT(./filepath) to write content to file.
+Command will throw if parent dir doesn't exist. Command will create file if file doesnt exist. Command will throw if file is already not empty, to prevent use WRITE_NEXT(filepath,overwrite=true)
 
 User will initiate tasks by writing to this chat tab. When the task is finished, output your summary without EXECUTE_NEXT_* triggers to stop the cycle.
 
