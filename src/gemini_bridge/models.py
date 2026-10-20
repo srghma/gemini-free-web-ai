@@ -2,7 +2,14 @@ import asyncio
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 import re
+
+def get_default_work_dir() -> str:
+    repo = Path.home() / "projects" / "gemini-free-web-ai"
+    if repo.exists():
+        return str(repo)
+    return str(Path.cwd())
 
 @dataclass
 class CodeBlock:
@@ -35,7 +42,7 @@ class ChatTurn:
 def extract_fenced_code_blocks(text: str) -> list[CodeBlock]:
     if not text:
         return []
-    pattern = re.compile(r"```([a-zA-Z0-9_-]+)?\s*[\r\n]+([\s\S]*?)[\r\n]+```")
+    pattern = re.compile(r"```([a-zA-Z0-9_-]+)?\s*\r?\n([\s\S]*?)\r?\n```")
     blocks: list[CodeBlock] = []
     for m in pattern.finditer(text):
         lang = (m.group(1) or "bash").lower()
@@ -56,6 +63,7 @@ class TabSession:
     writer: asyncio.StreamWriter | None = None
     turns: list[ChatTurn] = field(default_factory=list)
     last_seen: datetime = field(default_factory=datetime.now)
+    cwd: str = field(default_factory=get_default_work_dir)
     scroll_offset: int = 0
     follow_bottom: bool = True
     handled_turn_ids: set[str] = field(default_factory=set)
@@ -65,7 +73,6 @@ class TabSession:
         if not raw_turns:
             return
 
-        # If incoming turns represent full history starting at index 0, adopt authoritative incoming order
         if raw_turns and (raw_turns[0].get("id") == "net_turn_0" or len(raw_turns) >= len(self.turns)):
             turn_order: list[str] = []
         else:

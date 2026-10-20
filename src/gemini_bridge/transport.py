@@ -87,28 +87,45 @@ def make_ws_frame(message: str, opcode: int = 0x81) -> bytes:
     return bytes(frame)
 
 async def read_ws_frame(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> str | None:
+    """Reads complete WebSocket messages, handling fragmentation (continuation frames)."""
+    full_payload = bytearray()
+
+    while True:
+        try:
+            header = await reader.readexactly(2)
+        except (asyncio.IncompleteReadError, ConnectionResetError):
+            return None
+
+        b1, b2 = header
+        fin = (b1 & 0x80) != 0
+        opcode = b1 & 0x0F
+
+        if opcode == 0x8:  # Connection close
+            return None
+        if opcode == 0x9:  # Ping -> reply Pong
+            writer.write(make_ws_frame("", opcode=0x8A))
+            await writer.drain()
+            continue
+        if opcode == 0xA:  # Pong
+            continue
+
+        length = b2 & 0x7F
+        if length == 126:
+            ext = await reader.readexactly(2)
+            length = struct.unpack("!H", ext)[0]
+        elif length == 127:
+            ext = await reader.readexactly(8)
+            length = struct.unpack("!Q", ext)[0]
+
+        mask = await reader.readexactly(4)
+        payload = await reader.readexactly(length)
+        unmasked = bytearray(b ^ mask[i % 4] for i, b in enumerate(payload))
+        full_payload.extend(unmasked)
+
+        if fin:
+            break
+
     try:
-        header = await reader.readexactly(2)
-    except (asyncio.IncompleteReadError, ConnectionResetError):
-        return None
-
-    b1, b2 = header
-    opcode = b1 & 0x0F
-    if opcode == 0x8:
-        return None
-    if opcode == 0x9:
-        writer.write(make_ws_frame("", opcode=0x8A))
-        await writer.drain()
-        return ""
-
-    length = b2 & 0x7F
-    if length == 126:
-        ext = await reader.readexactly(2)
-        length = struct.unpack("!H", ext)[0]
-    elif length == 127:
-        ext = await reader.readexactly(8)
-        length = struct.unpack("!Q", ext)[0]
-
-    mask = await reader.readexactly(4)
-    payload = await reader.readexactly(length)
-    return bytearray(b ^ mask[i % 4] for i, b in enumerate(payload)).decode("utf-8")
+        return full_payload.decode("utf-8")
+    except UnicodeDecodeError:
+        return full_payload.decode("utf-8", errors="replace")

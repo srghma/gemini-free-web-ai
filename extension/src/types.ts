@@ -1,3 +1,5 @@
+export type AutomationMode = "auto" | "manual";
+
 export interface ExtractedCodeBlock {
   language: string;
   code: string;
@@ -35,4 +37,10 @@ export interface PromptBoxStatus {
   isAiPrinting: boolean;
 }
 
-export type BridgeConnectionStatus = "ready" | "running" | "error" | "offline";
+export type BridgeConnectionStatus =
+  | "ready"
+  | "running"
+  | "waiting"
+  | "review"
+  | "error"
+  | "offline";

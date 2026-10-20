@@ -1,10 +1,13 @@
 import asyncio
+from collections.abc import Callable
 import os
 import re
+import shutil
 import signal
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from .models import TabSession, get_default_work_dir
 
 TIMEOUT_UNITS = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
 
@@ -15,7 +18,6 @@ class ExecutionResult:
     exit_code: int
 
 def parse_timeout(val: str | None, default: float = 60.0) -> float:
-    """Parse timeout strings like '2h', '30m', '45s', '1d'. Default: 60s."""
     if not val:
         return default
     match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)([smhd])?", str(val).strip().lower())
@@ -25,7 +27,6 @@ def parse_timeout(val: str | None, default: float = 60.0) -> float:
     return float(num) * TIMEOUT_UNITS.get(unit or "s", 1.0)
 
 def format_interleaved(segments: list[tuple[str, str]]) -> str:
-    """Interleave stdout ('o') and stderr ('e')."""
     result: list[str] = []
     current_stream: str | None = None
     is_first = True
@@ -55,13 +56,12 @@ def get_execution_env() -> dict[str, str]:
     env["PATH"] = ":".join([p for p in extra_paths if p not in cur_path] + [cur_path])
     return env
 
-def get_default_work_dir() -> str:
-    repo = Path.home() / "projects" / "gemini-free-web-ai"
-    if repo.exists():
-        return str(repo)
-    return str(Path.cwd())
-
-async def run_subprocess_interleaved(cmd: list[str], cwd: str, timeout: float) -> ExecutionResult:
+async def run_subprocess_interleaved(
+    cmd: list[str],
+    cwd: str,
+    timeout: float,
+    on_chunk: Callable[[str, str], None] | None = None,
+) -> ExecutionResult:
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -78,7 +78,10 @@ async def run_subprocess_interleaved(cmd: list[str], cwd: str, timeout: float) -
             chunk = await stream.read(1024)
             if not chunk:
                 break
-            segments.append((stream_type, chunk.decode("utf-8", errors="replace")))
+            text = chunk.decode("utf-8", errors="replace")
+            segments.append((stream_type, text))
+            if on_chunk:
+                on_chunk(stream_type, text)
 
     try:
         await asyncio.wait_for(
@@ -106,7 +109,52 @@ async def run_subprocess_interleaved(cmd: list[str], cwd: str, timeout: float) -
             exit_code=124,
         )
 
-async def execute_task(lang: str, code: str, timeout: float) -> ExecutionResult:
+def resolve_session_path(session: TabSession, path_str: str) -> Path:
+    raw = path_str.strip().strip("'").strip('"')
+    target = Path(os.path.expanduser(raw))
+    if target.is_absolute():
+        return target.resolve()
+    base = Path(session.cwd) if session.cwd else Path(get_default_work_dir())
+    return (base / target).resolve()
+
+def execute_cd(session: TabSession, target_dir: str) -> ExecutionResult:
+    try:
+        resolved = resolve_session_path(session, target_dir)
+        if not resolved.exists():
+            return ExecutionResult(output=f"[e]Directory does not exist: {target_dir}", timed_out=False, exit_code=1)
+        if not resolved.is_dir():
+            return ExecutionResult(output=f"[e]Target is not a directory: {target_dir}", timed_out=False, exit_code=1)
+        session.cwd = str(resolved)
+        return ExecutionResult(output="", timed_out=False, exit_code=0)
+    except Exception as e:
+        return ExecutionResult(output=f"[e]{e}", timed_out=False, exit_code=1)
+
+def execute_write(session: TabSession, path_str: str, content: str, overwrite: bool) -> ExecutionResult:
+    try:
+        resolved = resolve_session_path(session, path_str)
+        parent = resolved.parent
+        if not parent.exists():
+            return ExecutionResult(output=f"[e]Parent directory does not exist: {parent}", timed_out=False, exit_code=1)
+        if not parent.is_dir():
+            return ExecutionResult(output=f"[e]Parent path is not a directory: {parent}", timed_out=False, exit_code=1)
+        if resolved.exists() and resolved.is_file() and resolved.stat().st_size > 0 and not overwrite:
+            return ExecutionResult(
+                output=f"[e]File already exists and is not empty: {resolved}. Use WRITE_NEXT({path_str},overwrite=true) to overwrite.",
+                timed_out=False,
+                exit_code=1,
+            )
+        resolved.write_text(content, encoding="utf-8")
+        return ExecutionResult(output="", timed_out=False, exit_code=0)
+    except Exception as e:
+        return ExecutionResult(output=f"[e]{e}", timed_out=False, exit_code=1)
+
+async def execute_task(
+    lang: str,
+    code: str,
+    timeout: float,
+    cwd: str | None = None,
+    on_chunk: Callable[[str, str], None] | None = None,
+) -> ExecutionResult:
     ext_map = {"python": ".py", "bash": ".sh", "bun": ".ts"}
     suffix = ext_map.get(lang, ".sh")
 
@@ -115,13 +163,15 @@ async def execute_task(lang: str, code: str, timeout: float) -> ExecutionResult:
         tmp_path = f.name
 
     try:
+        shell = "zsh" if shutil.which("zsh") else "bash"
         cmd = {
             "python": ["python3", tmp_path],
             "bun": ["bun", "run", tmp_path],
-        }.get(lang, ["zsh", tmp_path])
+            "bash": ["bash", tmp_path] if shutil.which("bash") else [shell, tmp_path],
+        }.get(lang, [shell, tmp_path])
 
-        cwd = get_default_work_dir()
-        return await run_subprocess_interleaved(cmd, cwd, timeout)
+        effective_cwd = cwd or get_default_work_dir()
+        return await run_subprocess_interleaved(cmd, effective_cwd, timeout, on_chunk=on_chunk)
     except Exception as e:
         return ExecutionResult(output=f"[e]{e}", timed_out=False, exit_code=1)
     finally:

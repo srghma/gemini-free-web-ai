@@ -1,9 +1,10 @@
+import { hasExecutableCommands } from "./dom/commandDetector";
 import { buildExportJson } from "./dom/jsonExporter";
 import { extractCandidatesFromClosureResponse, parseTurnsFromRequest } from "./dom/networkParser";
 import { ensurePresetSelected } from "./dom/preset";
 import { getPromptBoxStatus, submitPrompt } from "./dom/promptBox";
 import { clickVariantChoice, detectPreferenceVote } from "./dom/variantDetector";
-import type { ExtractedTurn, PreferenceVoteData } from "./types";
+import type { AutomationMode, ExtractedTurn, PreferenceVoteData } from "./types";
 import { StatusBadgeManager } from "./ui/statusBadge";
 import { BridgeWebSocket } from "./ws/client";
 
@@ -12,17 +13,117 @@ import { BridgeWebSocket } from "./ws/client";
   const statusBadge = new StatusBadgeManager();
   const wsClient = new BridgeWebSocket(statusBadge, tabId);
 
-  let lastNetworkReqPayload: unknown = null;
   let currentModel = "models/gemini-3.8-flash";
+  let lastNetworkReqPayload: unknown = null;
   let turnsHistory: ExtractedTurn[] = [];
+  let pendingManualPayload: Record<string, unknown> | null = null;
 
   const updateBadgeUI = (): void => {
     if (statusBadge.isDisabled) return;
-    const promptStatus = getPromptBoxStatus();
-    statusBadge.render(promptStatus);
+    statusBadge.render(getPromptBoxStatus());
   };
 
-  // 1. Network generation started (pure XHR)
+  const createAiTurn = (text: string): ExtractedTurn => ({
+    id: `net_turn_${turnsHistory.length}`,
+    type: "ai_chat",
+    status: "completed",
+    chatContent: text,
+    codeBlocks: [],
+  });
+
+  const sendChatUpdate = (opts: {
+    isPrinting: boolean;
+    isStreaming?: boolean;
+    preferenceVote?: PreferenceVoteData | null;
+  }): void => {
+    const promptStatus = getPromptBoxStatus();
+    wsClient.send({
+      event: "tab_chat_update",
+      tabId,
+      isPrinting: opts.isPrinting,
+      isNetworkStreaming: opts.isStreaming ?? opts.isPrinting,
+      buttonLabel: promptStatus.buttonLabel,
+      promptText: promptStatus.promptText,
+      turns: turnsHistory,
+      preferenceVote: opts.preferenceVote ?? null,
+    });
+  };
+
+  const createPreferenceVote = (candidates: string[]): PreferenceVoteData => ({
+    question: "Which response do you prefer?",
+    options: candidates.map((text, idx) => ({
+      index: idx,
+      side: idx === 1 ? ("right" as const) : ("left" as const),
+      text,
+    })),
+    hasSubmitButton: true,
+    isSubmitDisabled: false,
+  });
+
+  const commitCandidates = (candidates: string[]): PreferenceVoteData | null => {
+    if (candidates.length > 1) {
+      statusBadge.setReady("⚖️ Preference Vote Pending...");
+      return createPreferenceVote(candidates);
+    }
+
+    const first = candidates[0];
+    if (first) {
+      turnsHistory.push(createAiTurn(first));
+    }
+
+    statusBadge.setReady("Daemon Ready");
+    return first ? null : detectPreferenceVote();
+  };
+
+  const finalizeGeneration = (candidates: string[]): void => {
+    const preferenceVote = commitCandidates(candidates);
+    updateBadgeUI();
+
+    const promptStatus = getPromptBoxStatus();
+    const updatePayload = {
+      event: "tab_chat_update",
+      tabId,
+      isPrinting: false,
+      isNetworkStreaming: false,
+      buttonLabel: promptStatus.buttonLabel,
+      promptText: promptStatus.promptText,
+      turns: turnsHistory,
+      preferenceVote,
+    };
+
+    const lastTurn = turnsHistory[turnsHistory.length - 1];
+    const latestText = lastTurn?.chatContent || candidates.join("\n");
+    const containsCommands = hasExecutableCommands(latestText);
+
+    if (containsCommands && statusBadge.mode === "manual") {
+      pendingManualPayload = updatePayload;
+      statusBadge.setReview("⏸ Review Commands (Click Send)");
+      statusBadge.setPendingSend(true);
+      return;
+    }
+
+    pendingManualPayload = null;
+    statusBadge.setPendingSend(false);
+    wsClient.send(updatePayload);
+  };
+
+  const dispatchPendingManual = (): void => {
+    if (pendingManualPayload) {
+      wsClient.send(pendingManualPayload);
+      pendingManualPayload = null;
+      statusBadge.setPendingSend(false);
+      statusBadge.setReady("Commands Dispatched");
+      updateBadgeUI();
+    }
+  };
+
+  statusBadge.onSend(dispatchPendingManual);
+
+  statusBadge.onModeChange((newMode: AutomationMode) => {
+    if (newMode === "auto") dispatchPendingManual();
+  });
+
+  // 1. Network generation started (pure XHR stream active)
   window.addEventListener("gemini_generation_start", ((e: Event) => {
     const ce = e as CustomEvent<{ model?: string; payload?: unknown }>;
     currentModel = ce.detail?.model || currentModel;
@@ -30,27 +131,19 @@ import { BridgeWebSocket } from "./ws/client";
 
     if (lastNetworkReqPayload) {
       const priorTurns = parseTurnsFromRequest(lastNetworkReqPayload);
-      if (priorTurns.length > 0) {
-        turnsHistory = priorTurns;
-      }
+      if (priorTurns.length > 0) turnsHistory = priorTurns;
     }
 
-    statusBadge.setReady("AI Generating (Stream Active)...");
+    pendingManualPayload = null;
+    statusBadge.setPendingSend(false);
+
+    statusBadge.setRunning("AI Generating...");
     updateBadgeUI();
 
-    const promptStatus = getPromptBoxStatus();
-    wsClient.send({
-      event: "tab_chat_update",
-      tabId,
-      isPrinting: true,
-      isNetworkStreaming: true,
-      buttonLabel: promptStatus.buttonLabel,
-      promptText: promptStatus.promptText,
-      turns: turnsHistory,
-    });
+    sendChatUpdate({ isPrinting: true, isStreaming: true });
   }) as EventListener);
 
-  // 2. Network generation completed (pure XHR)
+  // 2. Network generation completed (pure XHR stream ended)
   window.addEventListener("gemini_generation_end", ((e: Event) => {
     const ce = e as CustomEvent<{
       model?: string;
@@ -63,63 +156,15 @@ import { BridgeWebSocket } from "./ws/client";
     const rawResponse = ce.detail?.fullResponse || "";
     const candidates = extractCandidatesFromClosureResponse(rawResponse);
 
-    let preferenceVote: PreferenceVoteData | null = null;
-
-    if (candidates.length > 1) {
-      preferenceVote = {
-        question: "Which response do you prefer?",
-        options: candidates.map((text, idx) => ({
-          index: idx,
-          side: idx === 1 ? ("right" as const) : ("left" as const),
-          text,
-        })),
-        hasSubmitButton: true,
-        isSubmitDisabled: false,
-      };
-      statusBadge.setReady("⚖️ Preference Vote Pending...");
-    } else if (candidates.length === 1 && candidates[0]) {
-      turnsHistory.push({
-        id: `net_turn_${turnsHistory.length}`,
-        type: "ai_chat",
-        status: "completed",
-        chatContent: candidates[0],
-        codeBlocks: [],
-      });
-      statusBadge.setReady("Daemon Ready");
-    } else {
-      // Check DOM fallback for vote
-      preferenceVote = detectPreferenceVote();
-      statusBadge.setReady("Daemon Ready");
-    }
-
-    updateBadgeUI();
-
-    const promptStatus = getPromptBoxStatus();
-    wsClient.send({
-      event: "tab_chat_update",
-      tabId,
-      isPrinting: false,
-      isNetworkStreaming: false,
-      buttonLabel: promptStatus.buttonLabel,
-      promptText: promptStatus.promptText,
-      turns: turnsHistory,
-      preferenceVote,
-    });
+    finalizeGeneration(candidates);
   }) as EventListener);
 
   window.addEventListener("gemini_generation_error", () => {
     statusBadge.setReady("Generation Error");
     updateBadgeUI();
-
-    wsClient.send({
-      event: "tab_chat_update",
-      tabId,
-      isPrinting: false,
-      isNetworkStreaming: false,
-    });
+    sendChatUpdate({ isPrinting: false, isStreaming: false });
   });
 
-  // Export JSON callback
   statusBadge.onExport(() => {
     const exportJson = buildExportJson(turnsHistory, currentModel, lastNetworkReqPayload);
     const jsonStr = JSON.stringify(exportJson, null, 2);
@@ -136,14 +181,11 @@ import { BridgeWebSocket } from "./ws/client";
     });
   });
 
-  wsClient.setInitialDataProvider(() => {
-    const promptStatus = getPromptBoxStatus();
-    return {
-      turns: turnsHistory,
-      prompt: promptStatus,
-      preferenceVote: detectPreferenceVote(),
-    };
-  });
+  wsClient.setInitialDataProvider(() => ({
+    turns: turnsHistory,
+    prompt: getPromptBoxStatus(),
+    preferenceVote: detectPreferenceVote(),
+  }));
 
   statusBadge.onToggle((enabled) => {
     if (enabled) wsClient.enable();
@@ -153,9 +195,12 @@ import { BridgeWebSocket } from "./ws/client";
   wsClient.onCommand("submit_prompt", async (payload) => {
     const text = typeof payload.text === "string" ? payload.text : "";
     if (text) {
-      statusBadge.setReady("Submitting Reply...");
-      await submitPrompt(text);
+      statusBadge.setWaiting("AI Rendering (Waiting to submit...)");
+      await submitPrompt(text, (msg) => {
+        statusBadge.setWaiting(msg);
+      });
       statusBadge.setReady("Daemon Ready");
+      updateBadgeUI();
     }
   });
 
@@ -167,29 +212,12 @@ import { BridgeWebSocket } from "./ws/client";
     await clickVariantChoice(idx);
 
     if (selectedText) {
-      turnsHistory.push({
-        id: `net_turn_${turnsHistory.length}`,
-        type: "ai_chat",
-        status: "completed",
-        chatContent: selectedText,
-        codeBlocks: [],
-      });
+      turnsHistory.push(createAiTurn(selectedText));
     }
 
     statusBadge.setReady("Daemon Ready");
     updateBadgeUI();
-
-    const promptStatus = getPromptBoxStatus();
-    wsClient.send({
-      event: "tab_chat_update",
-      tabId,
-      isPrinting: false,
-      isNetworkStreaming: false,
-      buttonLabel: promptStatus.buttonLabel,
-      promptText: promptStatus.promptText,
-      turns: turnsHistory,
-      preferenceVote: null,
-    });
+    sendChatUpdate({ isPrinting: false, preferenceVote: null });
   });
 
   wsClient.onCommand("trigger_export", () => {

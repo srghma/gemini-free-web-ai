@@ -65,85 +65,95 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 continue
 
             log_raw_ws("RECV", current_tab_id or "unknown", raw_msg)
-            data = json.loads(raw_msg)
+
+            try:
+                data = json.loads(raw_msg)
+            except json.JSONDecodeError as jde:
+                state.add_log(f"[yellow]Ignored invalid JSON frame: {escape(str(jde))}[/yellow]")
+                continue
+
             event = data.get("event")
 
-            if event == "tab_connected":
-                current_tab_id = data.get("tabId")
-                if current_tab_id:
-                    session = state.tabs.setdefault(current_tab_id, TabSession(tab_id=current_tab_id))
+            try:
+                if event == "tab_connected":
+                    current_tab_id = data.get("tabId")
+                    if current_tab_id:
+                        session = state.tabs.setdefault(current_tab_id, TabSession(tab_id=current_tab_id))
+                        session.writer = writer
+                        session.title = data.get("title", "Chat")
+                        session.prompt_text = data.get("promptText", "")
+                        session.button_label = data.get("buttonLabel", "Run")
+                        session.last_seen = datetime.now()
+
+                        raw_turns = data.get("turns", [])
+                        session.merge_turns(raw_turns)
+
+                        handle_preference_vote(session, data.get("preferenceVote"), writer)
+                        check_and_dispatch_settled_turns(session, writer)
+
+                        tab_tag = escape(f"[{current_tab_id}]")
+                        state.add_log(f"🟢 [green]Chrome tab connected: {tab_tag} ({escape(session.title)}) - {len(session.turns)} turns[/green]")
+                        render_event.set()
+
+                elif event == "tab_chat_update":
+                    tab_id = data.get("tabId") or current_tab_id
+                    if not tab_id:
+                        continue
+                    session = state.tabs.setdefault(tab_id, TabSession(tab_id=tab_id))
                     session.writer = writer
-                    session.title = data.get("title", "Chat")
-                    session.prompt_text = data.get("promptText", "")
-                    session.button_label = data.get("buttonLabel", "Run")
+                    if "isPrinting" in data:
+                        session.is_printing = data.get("isPrinting", False)
+                    if "buttonLabel" in data:
+                        session.button_label = data.get("buttonLabel", "Run")
+                    if "promptText" in data:
+                        session.prompt_text = data.get("promptText", "")
                     session.last_seen = datetime.now()
 
-                    raw_turns = data.get("turns", [])
-                    session.merge_turns(raw_turns)
+                    raw_turns = data.get("turns")
+                    if raw_turns is not None:
+                        session.merge_turns(raw_turns)
 
-                    handle_preference_vote(session, data.get("preferenceVote"), writer)
+                    if "preferenceVote" in data:
+                        handle_preference_vote(session, data.get("preferenceVote"), writer)
+
                     check_and_dispatch_settled_turns(session, writer)
 
-                    tab_tag = escape(f"[{current_tab_id}]")
-                    state.add_log(f"🟢 [green]Chrome tab connected: {tab_tag} ({escape(session.title)}) - {len(session.turns)} turns[/green]")
+                    if not state.user_manually_selected and session.turns:
+                        cur_sel = state.get_selected_tab()
+                        if not cur_sel or not cur_sel.turns:
+                            try:
+                                state.selected_tab_idx = list(state.tabs.keys()).index(tab_id)
+                            except ValueError:
+                                pass
+
                     render_event.set()
 
-            elif event == "tab_chat_update":
-                tab_id = data.get("tabId") or current_tab_id
-                if not tab_id:
-                    continue
-                session = state.tabs.setdefault(tab_id, TabSession(tab_id=tab_id))
-                session.writer = writer
-                if "isPrinting" in data:
-                    session.is_printing = data.get("isPrinting", False)
-                if "buttonLabel" in data:
-                    session.button_label = data.get("buttonLabel", "Run")
-                if "promptText" in data:
-                    session.prompt_text = data.get("promptText", "")
-                session.last_seen = datetime.now()
+                elif event == "export_chat_json":
+                    tab_id = data.get("tabId") or current_tab_id or "chat"
+                    export_data = data.get("exportJson")
+                    if export_data:
+                        EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+                        ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        out_path = EXPORTS_DIR / f"{tab_id}_{ts_str}.json"
+                        out_path.write_text(json.dumps(export_data, indent=2), encoding="utf-8")
+                        tab_tag = escape(f"[{tab_id}]")
+                        state.add_log(f"💾 [bold green]Saved chat JSON export for {tab_tag} -> {out_path.name}[/bold green]")
+                        render_event.set()
 
-                raw_turns = data.get("turns")
-                if raw_turns is not None:
-                    session.merge_turns(raw_turns)
+                elif event == "tab_disconnected":
+                    tab_id = data.get("tabId") or current_tab_id
+                    if tab_id and tab_id in state.tabs:
+                        state.tabs.pop(tab_id, None)
+                        tab_tag = escape(f"[{tab_id}]")
+                        state.add_log(f"⚪ [dim]Tab disabled manually by user: {tab_tag}[/dim]")
+                        if state.tabs:
+                            state.selected_tab_idx = max(0, min(state.selected_tab_idx, len(state.tabs) - 1))
+                        else:
+                            state.selected_tab_idx = 0
+                        render_event.set()
 
-                if "preferenceVote" in data:
-                    handle_preference_vote(session, data.get("preferenceVote"), writer)
-
-                check_and_dispatch_settled_turns(session, writer)
-
-                if not state.user_manually_selected and session.turns:
-                    cur_sel = state.get_selected_tab()
-                    if not cur_sel or not cur_sel.turns:
-                        try:
-                            state.selected_tab_idx = list(state.tabs.keys()).index(tab_id)
-                        except ValueError:
-                            pass
-
-                render_event.set()
-
-            elif event == "export_chat_json":
-                tab_id = data.get("tabId") or current_tab_id or "chat"
-                export_data = data.get("exportJson")
-                if export_data:
-                    EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
-                    ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    out_path = EXPORTS_DIR / f"{tab_id}_{ts_str}.json"
-                    out_path.write_text(json.dumps(export_data, indent=2), encoding="utf-8")
-                    tab_tag = escape(f"[{tab_id}]")
-                    state.add_log(f"💾 [bold green]Saved chat JSON export for {tab_tag} -> {out_path.name}[/bold green]")
-                    render_event.set()
-
-            elif event == "tab_disconnected":
-                tab_id = data.get("tabId") or current_tab_id
-                if tab_id and tab_id in state.tabs:
-                    state.tabs.pop(tab_id, None)
-                    tab_tag = escape(f"[{tab_id}]")
-                    state.add_log(f"⚪ [dim]Tab disabled manually by user: {tab_tag}[/dim]")
-                    if state.tabs:
-                        state.selected_tab_idx = max(0, min(state.selected_tab_idx, len(state.tabs) - 1))
-                    else:
-                        state.selected_tab_idx = 0
-                    render_event.set()
+            except Exception as ev_err:
+                state.add_log(f"[yellow]Error processing event {event}: {escape(str(ev_err))}[/yellow]")
 
     except Exception:
         pass

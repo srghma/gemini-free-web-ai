@@ -1,12 +1,13 @@
 import asyncio
+from collections import deque
 import json
 import time
 from rich.markup import escape
-from .executor import execute_task, parse_timeout
+from .executor import ExecutionResult, execute_cd, execute_task, execute_write, parse_timeout
 from .formatter import format_execution_reply, group_replies
 from .models import (
     ChatTurn,
-        PreferenceOption,
+    PreferenceOption,
     PreferenceVote,
     ServerState,
     TabSession,
@@ -32,6 +33,23 @@ async def trigger_desktop_notification(title: str, body: str):
     except Exception:
         pass
 
+async def dispatch_command(
+    cmd: ParsedCommand,
+    session: TabSession | None,
+    timeout: float,
+    on_chunk=None,
+) -> ExecutionResult:
+    lang = cmd.lang.lower()
+    if lang == "cd":
+        return execute_cd(session, cmd.code) if session else ExecutionResult("[e]No session", False, 1)
+    if lang == "write_next":
+        return (
+            execute_write(session, cmd.path, cmd.code, cmd.overwrite)
+            if session
+            else ExecutionResult("[e]No session", False, 1)
+        )
+    return await execute_task(lang, cmd.code, timeout, cwd=session.cwd if session else None, on_chunk=on_chunk)
+
 async def batch_queue_worker():
     while not state.stop_requested:
         batch = await execution_queue.get()
@@ -47,6 +65,7 @@ async def batch_queue_worker():
         state.add_log(f"⚡ [yellow]Processing batch of {total} command(s) for {tab_tag}[/yellow]")
         render_event.set()
 
+        session = state.tabs.get(tab_id)
         replies: list[str] = []
 
         for idx, cmd in enumerate(batch.commands):
@@ -55,6 +74,17 @@ async def batch_queue_worker():
             timeout = parse_timeout(cmd.timeout)
             start_time = time.time()
 
+            tail_buffer = deque(maxlen=4)
+
+            def handle_chunk(stream_type: str, text: str):
+                for line in text.splitlines():
+                    if line.strip():
+                        prefix = "[e]" if stream_type == "e" else ""
+                        tail_buffer.append(f"{prefix}{line}")
+                if state.current_executing_task:
+                    state.current_executing_task["tail"] = list(tail_buffer)
+                    render_event.set()
+
             state.current_executing_task = {
                 "tab_id": tab_id,
                 "lang": lang,
@@ -62,11 +92,12 @@ async def batch_queue_worker():
                 "start": start_time,
                 "idx": idx + 1,
                 "total": total,
+                "tail": [],
             }
-            state.add_log(f"🚀 [{idx + 1}/{total}] Executing {lang.upper()} ({timeout:.0f}s timeout)")
+            state.add_log(f"🚀 [{idx + 1}/{total}] Executing {lang.upper()}")
             render_event.set()
 
-            log_to_file(f"EXECUTE [{tab_id}] ({idx + 1}/{total}) {lang.upper()} (timeout: {timeout}s)\n--- CODE ---\n{code}\n--- END CODE ---")
+            log_to_file(f"EXECUTE [{tab_id}] ({idx + 1}/{total}) {lang.upper()}\n--- CODE ---\n{code}\n--- END CODE ---")
             log_raw_ws("EVENT", tab_id, f"TASK_START ({idx + 1}/{total}): {lang.upper()}")
 
             try:
@@ -76,7 +107,7 @@ async def batch_queue_worker():
             except Exception:
                 pass
 
-            res = await execute_task(lang, code, timeout)
+            res = await dispatch_command(cmd, session, timeout, on_chunk=handle_chunk)
             elapsed = time.time() - start_time
             state.current_executing_task = None
 
@@ -95,8 +126,14 @@ async def batch_queue_worker():
             log_to_file(f"RESULT [{tab_id}] ({idx + 1}/{total}) Exit {res.exit_code} in {elapsed:.2f}s\n--- OUTPUT ---\n{res.output}\n--- END OUTPUT ---\n")
             log_raw_ws("EVENT", tab_id, f"TASK_END ({idx + 1}/{total}): Exit {res.exit_code} in {elapsed:.2f}s")
 
-            replies.append(format_execution_reply(lang, res))
+            reply = format_execution_reply(lang, res, tab_id=tab_id)
+            if reply:
+                replies.append(reply)
             render_event.set()
+
+            if not is_ok:
+                state.add_log(f"⚠️ [bold red]Command {idx + 1}/{total} failed, aborting remaining commands in batch[/bold red]")
+                break
 
         composite_reply = group_replies(replies)
         if composite_reply:
@@ -112,6 +149,8 @@ async def batch_queue_worker():
                 state.add_log(f"📤 [bold green]Dispatched grouped replies ({total} cmds) to prompt box {tab_tag}[/bold green]")
             except Exception as e:
                 state.add_log(f"[red]Failed sending grouped reply to {tab_tag}: {escape(str(e))}[/red]")
+        else:
+            state.add_log(f"✓ [dim]Batch completed with no reply output for {tab_tag}[/dim]")
 
         render_event.set()
         execution_queue.task_done()
@@ -164,7 +203,6 @@ def apply_user_variant_choice(session: TabSession, variant_idx: int):
     tab_tag = escape(f"[{session.tab_id}]")
     state.add_log(f"⚖️ [bold cyan]User selected Variant #{variant_idx + 1} ({chosen_opt.side}) for {tab_tag}[/bold cyan]")
 
-    # 1. Inform extension to click button in Google AI Studio
     try:
         msg = json.dumps({
             "command": "select_variant",
@@ -178,7 +216,6 @@ def apply_user_variant_choice(session: TabSession, variant_idx: int):
     except Exception as e:
         state.add_log(f"[red]Failed sending select_variant: {escape(str(e))}[/red]")
 
-    # 2. Append/commit turn locally
     turn_id = f"net_turn_{len(session.turns)}"
     committed_turn = ChatTurn(
         id=turn_id,
@@ -190,11 +227,9 @@ def apply_user_variant_choice(session: TabSession, variant_idx: int):
     session.turns.append(committed_turn)
     session.handled_turn_ids.add(turn_id)
 
-    # 3. Clear pending vote
     session.pending_variant_choice = None
     session.preference_vote = None
 
-    # 4. Check for EXECUTE_NEXT_* commands in selected variant
     commands = extract_commands_from_turn(committed_turn)
     if commands:
         state.add_log(f"📥 Found [cyan]{len(commands)}[/cyan] command(s) in selected variant for {tab_tag}")
@@ -205,7 +240,6 @@ def apply_user_variant_choice(session: TabSession, variant_idx: int):
     render_event.set()
 
 def check_and_dispatch_settled_turns(session: TabSession, writer: asyncio.StreamWriter):
-    # In pure network mode, session.is_printing is false ONLY when XHR has finished completely
     if session.is_printing or not session.turns or session.pending_variant_choice:
         return
 

@@ -4,18 +4,30 @@ from .models import ChatTurn
 
 @dataclass(frozen=True)
 class ParsedCommand:
-    lang: str          # "python", "bash", "bun"
+    lang: str          # "python", "bash", "bun", "cd", "write_next"
     timeout: str       # "60s", "2m", etc.
-    code: str
-    raw_trigger: str   # "EXECUTE_NEXT_PYTHON"
+    code: str          # code for execution/write, or target dir for cd
+    raw_trigger: str   # "EXECUTE_NEXT_PYTHON", "CD", "WRITE_NEXT"
+    path: str = ""     # file path for write_next
+    overwrite: bool = False
 
-TRIGGER_REGEX = re.compile(
+CD_REGEX = re.compile(
+    r"CD\(\s*['\"]?([^'\"\r\n)]+?)['\"]?\s*\)",
+    re.IGNORECASE,
+)
+
+WRITE_REGEX = re.compile(
+    r"WRITE_NEXT\(\s*['\"]?([^'\"\r\n,)]+?)['\"]?(?:\s*,\s*overwrite=(true|false))?\s*\)\s*\r?\n```(?:[a-zA-Z0-9_-]+)?\s*\r?\n([\s\S]*?)\r?\n```",
+    re.IGNORECASE,
+)
+
+EXEC_TRIGGER_REGEX = re.compile(
     r"(EXECUTE_NEXT_PYTHON|EXECUTE_NEXT_BASH|EXECUTE_NEXT_BUN)(?:\(timeout=([0-9]+(?:\.[0-9]+)?[smhd]?)\))?",
     re.IGNORECASE,
 )
 
-FENCED_CODE_REGEX = re.compile(
-    r"(EXECUTE_NEXT_PYTHON|EXECUTE_NEXT_BASH|EXECUTE_NEXT_BUN)(?:\(timeout=([0-9]+(?:\.[0-9]+)?[smhd]?)\))?\s*[\r\n]+```(?:[a-zA-Z0-9_-]+)?\s*[\r\n]+([\s\S]*?)[\r\n]+```",
+EXEC_FENCED_REGEX = re.compile(
+    r"(EXECUTE_NEXT_PYTHON|EXECUTE_NEXT_BASH|EXECUTE_NEXT_BUN)(?:\(timeout=([0-9]+(?:\.[0-9]+)?[smhd]?)\))?\s*\r?\n```(?:[a-zA-Z0-9_-]+)?\s*\r?\n([\s\S]*?)\r?\n```",
     re.IGNORECASE,
 )
 
@@ -25,23 +37,55 @@ def clean_extracted_code(code: str) -> str:
     return cleaned.strip()
 
 def extract_commands_from_text(text: str) -> list[ParsedCommand]:
-    commands: list[ParsedCommand] = []
-    for match in FENCED_CODE_REGEX.finditer(text):
-        trigger = match.group(1).upper()
-        timeout = match.group(2) or "60s"
-        code = match.group(3).strip()
-        lang = trigger.lower().replace("execute_next_", "")
-        if code:
-            commands.append(ParsedCommand(lang=lang, timeout=timeout, code=code, raw_trigger=trigger))
-    return commands
+    if not text:
+        return []
+
+    cd_cmds = [
+        (m.start(), ParsedCommand(lang="cd", timeout="5s", code=m.group(1).strip(), raw_trigger="CD"))
+        for m in CD_REGEX.finditer(text)
+        if m.group(1).strip()
+    ]
+
+    write_cmds = [
+        (
+            m.start(),
+            ParsedCommand(
+                lang="write_next",
+                timeout="10s",
+                code=m.group(3).strip(),
+                raw_trigger="WRITE_NEXT",
+                path=m.group(1).strip(),
+                overwrite=(m.group(2) or "").lower() == "true",
+            ),
+        )
+        for m in WRITE_REGEX.finditer(text)
+        if m.group(1).strip()
+    ]
+
+    exec_cmds = [
+        (
+            m.start(),
+            ParsedCommand(
+                lang=m.group(1).upper().lower().replace("execute_next_", ""),
+                timeout=m.group(2) or "60s",
+                code=m.group(3).strip(),
+                raw_trigger=m.group(1).upper(),
+            ),
+        )
+        for m in EXEC_FENCED_REGEX.finditer(text)
+        if m.group(3).strip()
+    ]
+
+    all_cmds = cd_cmds + write_cmds + exec_cmds
+    all_cmds.sort(key=lambda item: item[0])
+    return [cmd for _, cmd in all_cmds]
 
 def extract_commands_from_turn(turn: ChatTurn) -> list[ParsedCommand]:
-    """Extracts all commands from a model turn, handling both fenced text and pre-parsed code blocks."""
     cmds = extract_commands_from_text(turn.chat_content)
     if cmds:
         return cmds
 
-    triggers = list(TRIGGER_REGEX.finditer(turn.chat_content))
+    triggers = list(EXEC_TRIGGER_REGEX.finditer(turn.chat_content))
     if triggers and turn.code_blocks:
         paired: list[ParsedCommand] = []
         for i, match in enumerate(triggers):
