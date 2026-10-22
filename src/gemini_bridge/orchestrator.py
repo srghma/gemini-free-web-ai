@@ -7,6 +7,7 @@ from .executor import ExecutionResult, execute_cd, execute_task, execute_write, 
 from .formatter import format_execution_reply, group_replies
 from .models import (
     ChatTurn,
+    CodeBlock,
     PreferenceOption,
     PreferenceVote,
     ServerState,
@@ -17,6 +18,7 @@ from .models import (
 )
 from .parser import ParsedCommand, extract_commands_from_turn
 from .transport import log_raw_ws, log_to_file, make_ws_frame
+from .truncator import save_and_truncate_output
 
 class CommandBatch:
     def __init__(self, tab_id: str, writer: asyncio.StreamWriter, commands: list[ParsedCommand]):
@@ -49,6 +51,146 @@ async def dispatch_command(
             else ExecutionResult("[e]No session", False, 1)
         )
     return await execute_task(lang, cmd.code, timeout, cwd=session.cwd if session else None, on_chunk=on_chunk)
+
+async def handle_function_call(
+    session: TabSession,
+    writer: asyncio.StreamWriter,
+    name: str,
+    args: dict,
+    call_id: str = "",
+):
+    tab_id = session.tab_id
+    tab_tag = escape(f"[{tab_id}]")
+    normalized_name = name.lower().replace("ee:", "").strip()
+    timeout = parse_timeout(str(args.get("timeout") or "60s"))
+    start_time = time.time()
+
+    tail_buffer = deque(maxlen=4)
+
+    def handle_chunk(stream_type: str, text: str):
+        for line in text.splitlines():
+            if line.strip():
+                prefix = "[e]" if stream_type == "e" else ""
+                tail_buffer.append(f"{prefix}{line}")
+        if state.current_executing_task:
+            state.current_executing_task["tail"] = list(tail_buffer)
+            render_event.set()
+
+    state.current_executing_task = {
+        "tab_id": tab_id,
+        "lang": normalized_name,
+        "timeout": timeout,
+        "start": start_time,
+        "idx": 1,
+        "total": 1,
+        "tail": [],
+    }
+
+    state.add_log(f"⚡ [bold cyan]Tool Call: {escape(name)} for {tab_tag}[/bold cyan]")
+    render_event.set()
+
+    # Log tool turn in TUI chat view
+    args_json = json.dumps(args, indent=2)
+    session.turns.append(
+        ChatTurn(
+            id=f"tool_call_{int(start_time * 1000)}",
+            type="ai_chat",
+            status="completed",
+            chat_content=f"🔧 [bold cyan]TOOL CALL:[/bold cyan] `{name}`",
+            code_blocks=[CodeBlock(language="json", code=args_json)],
+        )
+    )
+
+    custom_cwd = args.get("cwd")
+    if custom_cwd:
+        execute_cd(session, str(custom_cwd))
+
+    result_output = ""
+    exit_code = 0
+
+    if normalized_name in {"execute_bash", "bash", "execute_next_bash"}:
+        cmds_raw = args.get("commands") or args.get("command") or args.get("code") or []
+        cmds = cmds_raw if isinstance(cmds_raw, list) else [str(cmds_raw)]
+        combined_outputs = []
+
+        for idx, cmd_str in enumerate(cmds):
+            state.add_log(f"🚀 [{idx + 1}/{len(cmds)}] bash: [dim]{escape(cmd_str[:60])}[/dim]")
+            render_event.set()
+            res = await execute_task("bash", cmd_str, timeout, cwd=session.cwd, on_chunk=handle_chunk)
+            if res.output:
+                combined_outputs.append(res.output)
+            if res.exit_code != 0:
+                exit_code = res.exit_code
+                state.add_log(f"[bold red]✗ Command exited {res.exit_code}[/bold red]")
+                break
+
+        result_output = "\n".join(combined_outputs)
+
+    elif normalized_name in {"execute_python", "python", "execute_next_python"}:
+        code = str(args.get("code") or "")
+        res = await execute_task("python", code, timeout, cwd=session.cwd, on_chunk=handle_chunk)
+        exit_code = res.exit_code
+        result_output = res.output
+
+    elif normalized_name in {"change_directory", "cd"}:
+        target_path = str(args.get("path") or args.get("dir") or "")
+        res = execute_cd(session, target_path)
+        exit_code = res.exit_code
+        result_output = res.output or f"Directory changed to: {session.cwd}"
+
+    elif normalized_name in {"write_file", "write_next"}:
+        file_path = str(args.get("path") or "")
+        content = str(args.get("content") or "")
+        overwrite = bool(args.get("overwrite", True))
+        res = execute_write(session, file_path, content, overwrite)
+        exit_code = res.exit_code
+        result_output = res.output or f"Successfully wrote {len(content)} characters to {file_path}"
+
+    else:
+        exit_code = 1
+        result_output = f"Unknown tool: {name}"
+
+    state.current_executing_task = None
+    elapsed = time.time() - start_time
+
+    if exit_code == 0:
+        state.tasks_completed += 1
+    else:
+        state.tasks_failed += 1
+
+    safe_output = save_and_truncate_output(normalized_name, result_output, tab_id=tab_id)
+
+    response_payload = {
+        "status": "success" if exit_code == 0 else "error",
+        "exit_code": exit_code,
+        "output": safe_output,
+    }
+
+    # Record tool response in TUI chat history
+    session.turns.append(
+        ChatTurn(
+            id=f"tool_resp_{int(time.time() * 1000)}",
+            type="user",
+            status="completed",
+            user_content=f"Tool Output ({name}, exit={exit_code}, {elapsed:.2f}s):\n{safe_output[:400]}",
+        )
+    )
+
+    try:
+        submit_msg = json.dumps({
+            "command": "submit_function_response",
+            "tabId": tab_id,
+            "callId": call_id,
+            "response": json.dumps(response_payload),
+        })
+        writer.write(make_ws_frame(submit_msg))
+        await writer.drain()
+        log_raw_ws("SEND", tab_id, submit_msg)
+        state.add_log(f"📤 [bold green]Injected tool response to {tab_tag} (exit={exit_code}) in {elapsed:.2f}s[/bold green]")
+    except Exception as e:
+        state.add_log(f"[red]Failed sending submit_function_response: {escape(str(e))}[/red]")
+
+    render_event.set()
 
 async def batch_queue_worker():
     while not state.stop_requested:

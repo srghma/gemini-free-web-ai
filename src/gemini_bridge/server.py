@@ -13,6 +13,7 @@ from .orchestrator import (
     batch_queue_worker,
     check_and_dispatch_settled_turns,
     execution_queue,
+    handle_function_call,
     handle_preference_vote,
 )
 from .transport import (
@@ -127,6 +128,16 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                                 pass
 
                     render_event.set()
+
+                elif event == "function_call":
+                    tab_id = data.get("tabId") or current_tab_id
+                    name = data.get("name") or "execute_bash"
+                    args = data.get("args") or {}
+                    call_id = data.get("callId") or ""
+                    if tab_id:
+                        session = state.tabs.setdefault(tab_id, TabSession(tab_id=tab_id))
+                        session.writer = writer
+                        asyncio.create_task(handle_function_call(session, writer, name, args, call_id))
 
                 elif event == "export_chat_json":
                     tab_id = data.get("tabId") or current_tab_id or "chat"

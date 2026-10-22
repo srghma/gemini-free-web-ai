@@ -37,6 +37,13 @@ export interface PromptBoxStatus {
   isAiPrinting: boolean;
 }
 
+export interface ActiveFunctionCall {
+  callId: string;
+  name: string;
+  args: Record<string, unknown>;
+  rawCode: string;
+}
+
 export type BridgeConnectionStatus =
   | "ready"
   | "running"

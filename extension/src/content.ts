@@ -1,10 +1,16 @@
 import { hasExecutableCommands } from "./dom/commandDetector";
+import { detectActiveFunctionCall, submitFunctionResponse } from "./dom/functionCall";
 import { buildExportJson } from "./dom/jsonExporter";
 import { extractCandidatesFromClosureResponse, parseTurnsFromRequest } from "./dom/networkParser";
 import { ensurePresetSelected } from "./dom/preset";
 import { getPromptBoxStatus, submitPrompt } from "./dom/promptBox";
 import { clickVariantChoice, detectPreferenceVote } from "./dom/variantDetector";
-import type { AutomationMode, ExtractedTurn, PreferenceVoteData } from "./types";
+import type {
+  ActiveFunctionCall,
+  AutomationMode,
+  ExtractedTurn,
+  PreferenceVoteData,
+} from "./types";
 import { StatusBadgeManager } from "./ui/statusBadge";
 import { BridgeWebSocket } from "./ws/client";
 
@@ -17,6 +23,7 @@ import { BridgeWebSocket } from "./ws/client";
   let lastNetworkReqPayload: unknown = null;
   let turnsHistory: ExtractedTurn[] = [];
   let pendingManualPayload: Record<string, unknown> | null = null;
+  let lastHandledCallSignature = "";
 
   const updateBadgeUI = (): void => {
     if (statusBadge.isDisabled) return;
@@ -35,6 +42,7 @@ import { BridgeWebSocket } from "./ws/client";
     isPrinting: boolean;
     isStreaming?: boolean;
     preferenceVote?: PreferenceVoteData | null;
+    activeFunctionCall?: ActiveFunctionCall | null;
   }): void => {
     const promptStatus = getPromptBoxStatus();
     wsClient.send({
@@ -46,7 +54,42 @@ import { BridgeWebSocket } from "./ws/client";
       promptText: promptStatus.promptText,
       turns: turnsHistory,
       preferenceVote: opts.preferenceVote ?? null,
+      activeFunctionCall: opts.activeFunctionCall ?? null,
     });
+  };
+
+  const dispatchFunctionCallPayload = (call: ActiveFunctionCall): void => {
+    lastHandledCallSignature = `${call.name}_${call.rawCode}`;
+    statusBadge.setRunning(`Running Tool: ${call.name}`);
+
+    wsClient.send({
+      event: "function_call",
+      tabId,
+      name: call.name,
+      args: call.args,
+      callId: call.callId,
+    });
+  };
+
+  const checkAndDispatchFunctionCall = (): boolean => {
+    const activeCall = detectActiveFunctionCall();
+    if (!activeCall) return false;
+
+    const signature = `${activeCall.name}_${activeCall.rawCode}`;
+    if (signature === lastHandledCallSignature) return true;
+
+    if (statusBadge.mode === "manual") {
+      pendingManualPayload = {
+        _isFunctionCall: true,
+        call: activeCall,
+      };
+      statusBadge.setReview(`⏸ Review ${activeCall.name} (Click Send)`);
+      statusBadge.setPendingSend(true);
+      return true;
+    }
+
+    dispatchFunctionCallPayload(activeCall);
+    return true;
   };
 
   const createPreferenceVote = (candidates: string[]): PreferenceVoteData => ({
@@ -79,6 +122,9 @@ import { BridgeWebSocket } from "./ws/client";
     const preferenceVote = commitCandidates(candidates);
     updateBadgeUI();
 
+    const isFnCall = checkAndDispatchFunctionCall();
+    if (isFnCall) return;
+
     const promptStatus = getPromptBoxStatus();
     const updatePayload = {
       event: "tab_chat_update",
@@ -89,6 +135,7 @@ import { BridgeWebSocket } from "./ws/client";
       promptText: promptStatus.promptText,
       turns: turnsHistory,
       preferenceVote,
+      activeFunctionCall: null,
     };
 
     const lastTurn = turnsHistory[turnsHistory.length - 1];
@@ -109,7 +156,11 @@ import { BridgeWebSocket } from "./ws/client";
 
   const dispatchPendingManual = (): void => {
     if (pendingManualPayload) {
-      wsClient.send(pendingManualPayload);
+      if (pendingManualPayload._isFunctionCall && pendingManualPayload.call) {
+        dispatchFunctionCallPayload(pendingManualPayload.call as ActiveFunctionCall);
+      } else {
+        wsClient.send(pendingManualPayload);
+      }
       pendingManualPayload = null;
       statusBadge.setPendingSend(false);
       statusBadge.setReady("Commands Dispatched");
@@ -123,7 +174,6 @@ import { BridgeWebSocket } from "./ws/client";
     if (newMode === "auto") dispatchPendingManual();
   });
 
-  // 1. Network generation started (pure XHR stream active)
   window.addEventListener("gemini_generation_start", ((e: Event) => {
     const ce = e as CustomEvent<{ model?: string; payload?: unknown }>;
     currentModel = ce.detail?.model || currentModel;
@@ -136,14 +186,12 @@ import { BridgeWebSocket } from "./ws/client";
 
     pendingManualPayload = null;
     statusBadge.setPendingSend(false);
-
     statusBadge.setRunning("AI Generating...");
     updateBadgeUI();
 
     sendChatUpdate({ isPrinting: true, isStreaming: true });
   }) as EventListener);
 
-  // 2. Network generation completed (pure XHR stream ended)
   window.addEventListener("gemini_generation_end", ((e: Event) => {
     const ce = e as CustomEvent<{
       model?: string;
@@ -156,7 +204,9 @@ import { BridgeWebSocket } from "./ws/client";
     const rawResponse = ce.detail?.fullResponse || "";
     const candidates = extractCandidatesFromClosureResponse(rawResponse);
 
-    finalizeGeneration(candidates);
+    setTimeout(() => {
+      finalizeGeneration(candidates);
+    }, 150);
   }) as EventListener);
 
   window.addEventListener("gemini_generation_error", () => {
@@ -204,6 +254,20 @@ import { BridgeWebSocket } from "./ws/client";
     }
   });
 
+  wsClient.onCommand("submit_function_response", async (payload) => {
+    const responseText =
+      typeof payload.response === "string"
+        ? payload.response
+        : JSON.stringify(payload.response || {});
+
+    statusBadge.setWaiting("Injecting tool output...");
+    await submitFunctionResponse(responseText, (msg) => {
+      statusBadge.setWaiting(msg);
+    });
+    statusBadge.setReady("Daemon Ready");
+    updateBadgeUI();
+  });
+
   wsClient.onCommand("select_variant", async (payload) => {
     const idx = typeof payload.variantIndex === "number" ? payload.variantIndex : 0;
     const selectedText = typeof payload.selectedText === "string" ? payload.selectedText : "";
@@ -228,6 +292,13 @@ import { BridgeWebSocket } from "./ws/client";
       exportJson,
     });
   });
+
+  const observer = new MutationObserver(() => {
+    if (detectActiveFunctionCall()) {
+      checkAndDispatchFunctionCall();
+    }
+  });
+  observer.observe(document.body, { childList: true, subtree: true });
 
   updateBadgeUI();
 
